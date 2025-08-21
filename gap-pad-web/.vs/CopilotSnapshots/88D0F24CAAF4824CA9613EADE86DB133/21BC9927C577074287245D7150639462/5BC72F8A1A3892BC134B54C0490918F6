@@ -1,0 +1,724 @@
+﻿import React, { useRef, useState, useEffect } from "react";
+
+export default function App() {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const detectionCanvasRef = useRef(null);
+  const [serial, setSerial] = useState("");
+  const [side, setSide] = useState("back");
+  const [validationMode, setValidationMode] = useState(false);
+  const [referenceImages, setReferenceImages] = useState({});
+  const [captureMode, setCaptureMode] = useState(false);
+  const [validationResult, setValidationResult] = useState(null);
+  const [showOverlay, setShowOverlay] = useState(false);
+  const [message, setMessage] = useState("");
+  const [validationStatus, setValidationStatus] = useState(null);
+  const validationIntervalRef = useRef(null);
+  const [showInstructions, setShowInstructions] = useState(true);
+  const [detectedPads, setDetectedPads] = useState([]);
+  const [showDetectionOverlay, setShowDetectionOverlay] = useState(false);
+
+  useEffect(() => {
+    // Load saved reference images from localStorage on component mount
+    const savedImages = localStorage.getItem('gapPadReferenceImages');
+    if (savedImages) {
+      try {
+        const parsed = JSON.parse(savedImages);
+        setReferenceImages(parsed);
+      } catch (e) {
+        console.error("Failed to parse saved images", e);
+        setMessage("Error loading saved images");
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { 
+            facingMode: "environment",
+            width: { ideal: 1920 },
+            height: { ideal: 1080 }
+          }, 
+          audio: false 
+        });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play();
+        }
+      } catch (err) {
+        console.error("Camera error", err);
+        setMessage("Camera access error. Please check permissions.");
+      }
+    })();
+
+    // Cleanup function for validation interval
+    return () => {
+      if (validationIntervalRef.current) {
+        clearInterval(validationIntervalRef.current);
+      }
+    };
+  }, []);
+
+  // Advanced gap pad detection based on your Python script approach
+  const detectGapPads = async (imageData) => {
+    return new Promise(async (resolve) => {
+      try {
+        console.log("Trying advanced HSV detection...");
+        
+        const tempCanvas = document.createElement('canvas');
+        const tempCtx = tempCanvas.getContext('2d');
+        
+        const img = new Image();
+        img.onload = async () => {
+          console.log(`Starting detection on image: ${img.width}x${img.height}`);
+          
+          tempCanvas.width = img.width;
+          tempCanvas.height = img.height;
+          tempCtx.drawImage(img, 0, 0);
+          
+          const imgData = tempCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height);
+          const data = imgData.data;
+          
+          console.log('Converting to HSV...');
+          // Convert to HSV for better color detection (similar to Python OpenCV)
+          const hsvData = rgbToHsv(data, tempCanvas.width, tempCanvas.height);
+          
+          console.log('Creating color mask...');
+          // Create mask for pink/magenta colors
+          const mask = createColorMask(hsvData, tempCanvas.width, tempCanvas.height);
+          
+          // Count mask pixels for debugging
+          let maskPixelCount = 0;
+          for (let i = 0; i < mask.length; i++) {
+            if (mask[i] === 255) maskPixelCount++;
+          }
+          console.log(`Color mask contains ${maskPixelCount} pink/magenta pixels (${((maskPixelCount/(tempCanvas.width*tempCanvas.height))*100).toFixed(2)}% of image)`);
+          
+          // If HSV detection found very few pixels, try simple RGB detection
+          if (maskPixelCount < 100) {
+            console.log("HSV detection found too few pixels, trying simple RGB detection...");
+            const simplePads = await detectGapPadsSimple(imageData);
+            if (simplePads.length > 0) {
+              console.log(`Simple detection succeeded with ${simplePads.length} pads`);
+              resolve(simplePads);
+              return;
+            }
+          }
+          
+          console.log('Finding contours...');
+          // Find contours (connected components)
+          const contours = findContours(mask, tempCanvas.width, tempCanvas.height);
+          
+          console.log('Filtering gap pads...');
+          // Filter contours by size and aspect ratio (similar to your Python script)
+          const validPads = filterGapPadsAdvanced(contours, tempCanvas.width, tempCanvas.height);
+          
+          // Draw detection results
+          drawDetectionResults(tempCtx, validPads, tempCanvas.width, tempCanvas.height);
+          
+          console.log(`✅ Detection complete: Found ${validPads.length} gap pads`);
+          resolve(validPads);
+        };
+        
+        img.onerror = async (error) => {
+          console.error('HSV detection image loading error:', error);
+          console.log('Trying simple RGB detection as fallback...');
+          const simplePads = await detectGapPadsSimple(imageData);
+          resolve(simplePads);
+        };
+        
+        img.src = imageData;
+        
+      } catch (error) {
+        console.error('Advanced detection failed:', error);
+        console.log('Trying simple RGB detection as fallback...');
+        try {
+          const simplePads = await detectGapPadsSimple(imageData);
+          resolve(simplePads);
+        } catch (fallbackError) {
+          console.error('Fallback detection also failed:', fallbackError);
+          resolve([]);
+        }
+      }
+    });
+  };
+
+  // Convert RGB to HSV (similar to OpenCV cvtColor)
+  const rgbToHsv = (data, width, height) => {
+    const hsvData = new Uint8Array(width * height * 3);
+    
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i] / 255;
+      const g = data[i + 1] / 255;
+      const b = data[i + 2] / 255;
+      
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const delta = max - min;
+      
+      let h = 0;
+      let s = 0;
+      const v = max;
+      
+      if (delta !== 0) {
+        s = delta / max;
+        
+        if (max === r) {
+          h = ((g - b) / delta) % 6;
+        } else if (max === g) {
+          h = (b - r) / delta + 2;
+        } else {
+          h = (r - g) / delta + 4;
+        }
+        h *= 60;
+        if (h < 0) h += 360;
+      }
+      
+      const pixelIndex = (i / 4) * 3;
+      hsvData[pixelIndex] = h;           // H: 0-360
+      hsvData[pixelIndex + 1] = s * 100; // S: 0-100
+      hsvData[pixelIndex + 2] = v * 100; // V: 0-100
+    }
+    
+    return hsvData;
+  };
+
+  // Create mask for gap pad colors only (magenta, cyan, silver) - Board-aware detection
+  const createColorMask = (hsvData, width, height) => {
+    const mask = new Uint8Array(width * height);
+    
+    // Gap pad specific HSV ranges (based on your image examples)
+    // Range 1: Magenta gap pads (300-330°) - Most common thermal pads
+    const lowerMagenta = [300, 45, 50];
+    const upperMagenta = [330, 100, 95];
+    
+    // Range 2: Cyan gap pads (180-200°) - Less common but used
+    const lowerCyan = [180, 45, 50];
+    const upperCyan = [200, 100, 95];
+    
+    // Range 3: Silver/metallic gap pads (low saturation, high value)
+    const lowerSilver = [0, 0, 75];    // Any hue, very low saturation, high brightness
+    const upperSilver = [360, 15, 95]; // Any hue, very low saturation, high brightness
+    
+    let detectedPixels = 0;
+    let excludedPixels = 0;
+    
+    for (let i = 0; i < hsvData.length; i += 3) {
+      const h = hsvData[i];
+      const s = hsvData[i + 1];
+      const v = hsvData[i + 2];
+      
+      // EXCLUDE board colors first (negative detection)
+      const isBluePCB = (h >= 200 && h <= 250 && s >= 60 && v >= 30); // Blue PCB
+      const isYellowPCB = (h >= 45 && h <= 65 && s >= 70 && v >= 60); // Yellow PCB edges
+      const isBlackComponent = (v <= 25); // Black components (very dark)
+      const isGrayComponent = (s <= 20 && v >= 25 && v <= 70); // Gray components
+      const isGoldenConnector = (h >= 35 && h <= 55 && s >= 40 && s <= 80 && v >= 50); // Golden connectors
+      const isWhiteComponent = (s <= 25 && v >= 80); // White/cream components
+      
+      // If it's a board color, exclude it
+      if (isBluePCB || isYellowPCB || isBlackComponent || isGrayComponent || isGoldenConnector || isWhiteComponent) {
+        mask[i / 3] = 0;
+        excludedPixels++;
+        continue;
+      }
+      
+      // INCLUDE only gap pad colors (positive detection)
+      const isMagentaPad = (h >= lowerMagenta[0] && h <= upperMagenta[0] && 
+                           s >= lowerMagenta[1] && s <= upperMagenta[1] && 
+                           v >= lowerMagenta[2] && v <= upperMagenta[2]);
+      
+      const isCyanPad = (h >= lowerCyan[0] && h <= upperCyan[0] && 
+                        s >= lowerCyan[1] && s <= upperCyan[1] && 
+                        v >= lowerCyan[2] && v <= upperCyan[2]);
+      
+      const isSilverPad = (s >= lowerSilver[1] && s <= upperSilver[1] && 
+                          v >= lowerSilver[2] && v <= upperSilver[2]);
+      
+      if (isMagentaPad || isCyanPad || isSilverPad) {
+        mask[i / 3] = 255;
+        detectedPixels++;
+      } else {
+        mask[i / 3] = 0;
+      }
+    }
+    
+    console.log(`🎨 Board-aware detection: ${detectedPixels} gap pad pixels, ${excludedPixels} board pixels excluded (${((detectedPixels/(width*height))*100).toFixed(4)}%)`);
+    
+    // Apply more aggressive morphological cleanup for board environments
+    return morphologicalCleanupBoard(mask, width, height);
+  };
+
+  // Enhanced morphological cleanup for board environments
+  const morphologicalCleanupBoard = (mask, width, height) => {
+    // More aggressive opening to remove PCB trace noise
+    let result = erode(mask, width, height, 2); // Stronger erosion
+    result = dilate(result, width, height, 2);  // Restore size
+    
+    // Closing to fill gaps within gap pads
+    result = dilate(result, width, height, 1);
+    result = erode(result, width, height, 1);
+    
+    // Final noise removal - remove very small isolated pixels
+    result = removeSmallNoise(result, width, height, 25); // Remove clusters smaller than 25 pixels
+    
+    return result;
+  };
+
+  // Remove small noise clusters
+  const removeSmallNoise = (mask, width, height, minSize) => {
+    const result = new Uint8Array(mask);
+    const visited = new Set();
+    
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const index = y * width + x;
+        
+        if (mask[index] === 255 && !visited.has(index)) {
+          const cluster = [];
+          const queue = [{x, y}];
+          
+          while (queue.length > 0) {
+            const {x: cx, y: cy} = queue.shift();
+            const cIndex = cy * width + cx;
+            
+            if (visited.has(cIndex) || cx < 0 || cy < 0 || cx >= width || cy >= height || mask[cIndex] !== 255) {
+              continue;
+            }
+            
+            visited.add(cIndex);
+            cluster.push(cIndex);
+            
+            // Add 4-connected neighbors
+            queue.push({x: cx + 1, y: cy});
+            queue.push({x: cx - 1, y: cy});
+            queue.push({x: cx, y: cy + 1});
+            queue.push({x: cx, y: cy - 1});
+          }
+          
+          // If cluster is too small, remove it
+          if (cluster.length < minSize) {
+            cluster.forEach(idx => result[idx] = 0);
+          }
+        }
+      }
+    }
+    
+    return result;
+  };
+
+  // Morphological erosion
+  const erode = (mask, width, height, iterations) => {
+    let result = new Uint8Array(mask);
+    
+    for (let iter = 0; iter < iterations; iter++) {
+      const temp = new Uint8Array(width * height);
+      
+      for (let y = 1; y < height - 1; y++) {
+        for (let x = 1; x < width - 1; x++) {
+          const idx = y * width + x;
+          
+          // Check 3x3 neighborhood
+          let allWhite = true;
+          for (let dy = -1; dy <= 1 && allWhite; dy++) {
+            for (let dx = -1; dx <= 1 && allWhite; dx++) {
+              const nIdx = (y + dy) * width + (x + dx);
+              if (result[nIdx] !== 255) {
+                allWhite = false;
+              }
+            }
+          }
+          
+          temp[idx] = allWhite ? 255 : 0;
+        }
+      }
+      
+      result = temp;
+    }
+    
+    return result;
+  };
+
+  // Morphological dilation
+  const dilate = (mask, width, height, iterations) => {
+    let result = new Uint8Array(mask);
+    
+    for (let iter = 0; iter < iterations; iter++) {
+      const temp = new Uint8Array(width * height);
+      
+      for (let y = 1; y < height - 1; y++) {
+        for (let x = 1; x < width - 1; x++) {
+          const idx = y * width + x;
+          
+          // Check 3x3 neighborhood
+          let hasWhite = false;
+          for (let dy = -1; dy <= 1 && !hasWhite; dy++) {
+            for (let dx = -1; dx <= 1 && !hasWhite; dx++) {
+              const nIdx = (y + dy) * width + (x + dx);
+              if (result[nIdx] === 255) {
+                hasWhite = true;
+              }
+            }
+          }
+          
+          temp[idx] = hasWhite ? 255 : 0;
+        }
+      }
+      
+      result = temp;
+    }
+    
+    return result;
+  };
+
+  // Simpler RGB-based detection as fallback - Board-aware
+  const detectGapPadsSimple = async (imageData) => {
+    return new Promise((resolve) => {
+      const tempCanvas = document.createElement('canvas');
+      const tempCtx = tempCanvas.getContext('2d');
+      
+      const img = new Image();
+      img.onload = () => {
+        console.log(`Board-aware simple detection on image: ${img.width}x${img.height}`);
+        
+        tempCanvas.width = img.width;
+        tempCanvas.height = img.height;
+        tempCtx.drawImage(img, 0, 0);
+        
+        const imgData = tempCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height);
+        const data = imgData.data;
+        
+        // Create mask using board-aware RGB thresholds
+        const mask = new Uint8Array(tempCanvas.width * tempCanvas.height);
+        let gapPadPixelCount = 0;
+        let boardPixelCount = 0;
+        
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          const pixelIndex = i / 4;
+          
+          // EXCLUDE board colors (RGB-based)
+          const isBluePCB = (b > r + 30 && b > g + 30 && b > 100); // Blue dominant
+          const isYellowPCB = (r > 180 && g > 150 && b < 100 && r > b + 80); // Yellow
+          const isBlackComponent = (r < 50 && g < 50 && b < 50); // Very dark
+          const isGrayComponent = (Math.abs(r - g) < 20 && Math.abs(g - b) < 20 && r > 50 && r < 150); // Neutral gray
+          const isGoldenConnector = (r > 150 && g > 120 && b < 80 && r > g + 20); // Golden
+          const isWhiteComponent = (r > 200 && g > 200 && b > 200); // White/bright
+          
+          if (isBluePCB || isYellowPCB || isBlackComponent || isGrayComponent || isGoldenConnector || isWhiteComponent) {
+            mask[pixelIndex] = 0;
+            boardPixelCount++;
+            continue;
+          }
+          
+          // INCLUDE gap pad colors only
+          const isMagentaPad = (r > 120 && r > g + 30 && r > b + 10 && // Magenta: red dominant with some blue
+                               g < 150 && b > 80); // Not too green, some blue
+          
+          const isCyanPad = (b > r + 30 && g > r + 20 && // Cyan: blue and green dominant
+                            b > 120 && g > 120 && r < 120);
+          
+          const isSilverPad = (Math.abs(r - g) < 15 && Math.abs(g - b) < 15 && // Silver: neutral color
+                              r > 150 && g > 150 && b > 150 && // Bright
+                              r < 220 && g < 220 && b < 220); // But not pure white
+          
+          if (isMagentaPad || isCyanPad || isSilverPad) {
+            mask[pixelIndex] = 255;
+            gapPadPixelCount++;
+          } else {
+            mask[pixelIndex] = 0;
+          }
+        }
+        
+        console.log(`Board-aware simple detection: ${gapPadPixelCount} gap pad pixels, ${boardPixelCount} board pixels excluded (${((gapPadPixelCount/(tempCanvas.width*tempCanvas.height))*100).toFixed(2)}%)`);
+        
+        // Apply board-aware cleanup
+        const cleanMask = morphologicalCleanupBoard(mask, tempCanvas.width, tempCanvas.height);
+        
+        // Find contours in the cleaned mask
+        const contours = findContours(cleanMask, tempCanvas.width, tempCanvas.height);
+        console.log(`Board-aware simple detection found ${contours.length} contours`);
+        
+        // Filter contours with gap pad specific criteria
+        const validPads = [];
+        contours.forEach((contour, index) => {
+          const bbox = contour.boundingBox;
+          const area = bbox.width * bbox.height;
+          const aspectRatio = bbox.width / bbox.height;
+          
+          // Gap pad specific filtering (2cm x 2cm expected)
+          if (area > 200 && area < 5000 && // Reasonable size
+              aspectRatio > 0.5 && aspectRatio < 2.0) { // Roughly square
+            validPads.push({
+              x: (bbox.x + bbox.width / 2) / tempCanvas.width,
+              y: (bbox.y + bbox.height / 2) / tempCanvas.height,
+              width: bbox.width / tempCanvas.width,
+              height: bbox.height / tempCanvas.height,
+              area: area,
+              aspectRatio: aspectRatio,
+              confidence: 0.6, // Lower confidence for simple detection
+              boundingBox: bbox,
+              id: `board_aware_pad_${bbox.x}_${bbox.y}`
+            });
+            console.log(`Board-aware simple detection: accepted pad ${index} with area ${area}, aspect ${aspectRatio.toFixed(2)}`);
+          }
+        });
+        
+        console.log(`Board-aware simple detection result: ${validPads.length} pads`);
+        resolve(validPads);
+      };
+      
+      img.onerror = (error) => {
+        console.error('Board-aware simple detection image error:', error);
+        resolve([]);
+      };
+      
+      img.src = imageData;
+    });
+  };
+
+  // Find contours (connected components) - More strict version
+  const findContours = (mask, width, height) => {
+    const visited = new Set();
+    const contours = [];
+    
+    for (let y = 0; y < height; y += 2) { // Skip every other pixel for performance
+      for (let x = 0; x < width; x += 2) {
+        const index = y * width + x;
+        
+        if (mask[index] === 255 && !visited.has(index)) {
+          const contour = floodFill(mask, width, height, x, y, visited);
+          
+          // More strict minimum size threshold for gap pads
+          if (contour.points.length > 200) { // Increased from 50 to 200
+            contours.push(contour);
+          }
+        }
+      }
+    }
+    
+    console.log(`🔍 Found ${contours.length} contours with strict size filtering`);
+    return contours;
+  };
+
+  // Flood fill to find connected components
+  const floodFill = (mask, width, height, startX, startY, visited) => {
+    const queue = [{x: startX, y: startY}];
+    const points = [];
+    let minX = startX, maxX = startX, minY = startY, maxY = startY;
+    
+    while (queue.length > 0) {
+      const {x, y} = queue.shift();
+      const index = y * width + x;
+      
+      if (visited.has(index) || x < 0 || y < 0 || x >= width || y >= height || mask[index] !== 255) {
+        continue;
+      }
+      
+      visited.add(index);
+      points.push({x, y});
+      
+      // Update bounding box
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
+      
+      // Add 4-connected neighbors
+      queue.push({x: x + 1, y: y});
+      queue.push({x: x - 1, y: y});
+      queue.push({x: x, y: y + 1});
+      queue.push({x: x, y: y - 1});
+    }
+    
+    return {
+      points,
+      boundingBox: {
+        x: minX,
+        y: minY,
+        width: maxX - minX + 1,
+        height: maxY - minY + 1
+      }
+    };
+  };
+
+  // Draw detection results (similar to cv2.rectangle and cv2.putText)
+  const drawDetectionResults = (ctx, pads, width, height) => {
+    pads.forEach((pad, index) => {
+      const bbox = pad.boundingBox;
+      
+      // Draw detection rectangle with confidence-based color
+      const color = pad.confidence > 0.7 ? '#00ff00' : 
+                   pad.confidence > 0.5 ? '#ffff00' : '#ff6600';
+      
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(bbox.x, bbox.y, bbox.width, bbox.height);
+      
+      // Draw label background
+      const label = `P${index + 1} (${Math.round(pad.confidence * 100)}%)`;
+      ctx.font = '14px Arial';
+      const textWidth = ctx.measureText(label).width;
+      
+      ctx.fillStyle = color;
+      ctx.fillRect(bbox.x, bbox.y - 22, textWidth + 8, 22);
+      
+      // Draw label text
+      ctx.fillStyle = '#000000';
+      ctx.fillText(label, bbox.x + 4, bbox.y - 6);
+    });
+  };
+
+  // Test gap pad detection on current video frame
+  const testDetection = async () => {
+    if (!videoRef.current) {
+      setMessage("❌ Video not available");
+      return;
+    }
+
+    // Ensure canvas ref is available
+    if (!canvasRef.current) {
+      setMessage("❌ Canvas not available - check browser console");
+      console.error("Canvas ref is null:", canvasRef.current);
+      return;
+    }
+    
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    
+    // Make canvas visible temporarily for capture
+    canvas.style.display = "block";
+    canvas.style.position = "absolute";
+    canvas.style.top = "0";
+    canvas.style.left = "0";
+    canvas.style.zIndex = "10";
+    
+    console.log("=== BOARD-AWARE DETECTION TEST ===");
+    console.log("Video dimensions:", video.videoWidth, "x", video.videoHeight);
+    console.log("Canvas element:", canvas);
+    
+    try {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      
+      const imageData = canvas.toDataURL('image/jpeg');
+      console.log("Image data captured, length:", imageData.length);
+      
+      setMessage("Running board-aware gap pad detection...");
+      
+      console.log("Starting board-aware detection...");
+      const detectedPads = await detectGapPads(imageData);
+      console.log("Board-aware detection result:", detectedPads);
+      
+      setDetectedPads(detectedPads);
+      setShowDetectionOverlay(true);
+      setMessage(`✅ Board-aware detection complete! Found ${detectedPads.length} gap pads (excluding PCB colors)`);
+      
+      // Save a debug image to localStorage
+      localStorage.setItem('debugBoardAwareImage', imageData);
+      
+    } catch (error) {
+      console.error("Board-aware detection error:", error);
+      setMessage("❌ Board-aware detection failed. Check console for details.");
+    } finally {
+      // Hide canvas again
+      canvas.style.display = "none";
+    }
+  };
+
+  const captureReferenceImage = async () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    
+    if (!video) {
+      setMessage("❌ Video not available");
+      console.error("Video ref is null:", video);
+      return;
+    }
+    
+    if (!canvas) {
+      setMessage("❌ Canvas not available");
+      console.error("Canvas ref is null:", canvas);
+      return;
+    }
+    
+    console.log("=== BOARD-AWARE CAPTURE DEBUG ===");
+    console.log("Video dimensions:", video.videoWidth, "x", video.videoHeight);
+    console.log("Video ready state:", video.readyState);
+    console.log("Canvas element:", canvas);
+    
+    try {
+      const context = canvas.getContext('2d');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      
+      const imageData = canvas.toDataURL('image/jpeg');
+      const key = `${serial.trim().toUpperCase()}_${side}`;
+      
+      console.log("Image data length:", imageData.length);
+      console.log("Starting board-aware detection...");
+      
+      setMessage("Running board-aware gap pad detection...");
+      
+      // Try detection with error handling
+      let detectedPads = [];
+      try {
+        detectedPads = await detectGapPads(imageData);
+        console.log("Board-aware detection completed, found:", detectedPads.length, "pads");
+      } catch (detectionError) {
+        console.error("Board-aware detection failed:", detectionError);
+        setMessage("❌ Board-aware detection failed. Saving reference anyway...");
+        
+        // For now, let's save the image anyway without detection
+        // This allows testing the basic capture functionality
+      }
+      
+      if (detectedPads.length === 0) {
+        // Ask user if they want to save anyway or use manual mode
+        const saveAnyway = confirm("No gap pads detected with board-aware algorithm. This could mean:\n1. No gap pads are present\n2. Gap pads are a different color than expected\n3. Lighting conditions need adjustment\n\nSave reference anyway?");
+        if (!saveAnyway) {
+          setMessage("⚠️ Capture cancelled. Try different lighting or check gap pad colors.");
+          return;
+        }
+        detectedPads = []; // Save with empty positions
+      }
+      
+      // Save the reference image with detected positions (or empty array)
+      const updatedImages = {
+        ...referenceImages,
+        [key]: {
+          imageData,
+          timestamp: new Date().toISOString(),
+          serial: serial.trim().toUpperCase(),
+          side,
+          padPositions: detectedPads
+        }
+      };
+      
+      setReferenceImages(updatedImages);
+      localStorage.setItem('gapPadReferenceImages', JSON.stringify(updatedImages));
+      
+      if (detectedPads.length > 0) {
+        setMessage(`✅ Reference saved! Board-aware detection found ${detectedPads.length} gap pads`);
+      } else {
+        setMessage(`⚠️ Reference saved without gap pad detection. Ensure gap pads are magenta/cyan/silver colored.`);
+      }
+      setCaptureMode(false);
+      
+    } catch (error) {
+      console.error("Board-aware capture error:", error);
+      setMessage("❌ Capture failed. Check console for details.");
+    }
+  };

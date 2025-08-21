@@ -1,0 +1,2 @@
+"C:\Users\nashid\Downloads\node-v22.18.0-win-x64\node-v22.18.0-win-x64\npm.cmd" install
+"C:\Users\nashid\Downloads\node-v22.18.0-win-x64\node-v22.18.0-win-x64\npm.cmd" run dev

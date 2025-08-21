@@ -1,0 +1,729 @@
+﻿import React, { useRef, useState, useEffect } from "react";
+
+export default function App() {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const [serial, setSerial] = useState("");
+  const [side, setSide] = useState("back");
+  const [validationMode, setValidationMode] = useState(false);
+  const [referenceImages, setReferenceImages] = useState({});
+  const [captureMode, setCaptureMode] = useState(false);
+  const [validationResult, setValidationResult] = useState(null);
+  const [showOverlay, setShowOverlay] = useState(false);
+  const [message, setMessage] = useState("");
+  const [validationStatus, setValidationStatus] = useState(null);
+  const [manualPositions, setManualPositions] = useState([]);
+  const validationIntervalRef = useRef(null);
+  const [showInstructions, setShowInstructions] = useState(true);
+
+  useEffect(() => {
+    // Load saved reference images from localStorage on component mount
+    const savedImages = localStorage.getItem('gapPadReferenceImages');
+    if (savedImages) {
+      try {
+        const parsed = JSON.parse(savedImages);
+        setReferenceImages(parsed);
+      } catch (e) {
+        console.error("Failed to parse saved images", e);
+        setMessage("Error loading saved images");
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { 
+            facingMode: "environment",
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }, 
+          audio: false 
+        });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play();
+        }
+      } catch (err) {
+        console.error("Camera error", err);
+        setMessage("Camera access error. Please check permissions.");
+      }
+    })();
+
+    // Cleanup function for validation interval
+    return () => {
+      if (validationIntervalRef.current) {
+        clearInterval(validationIntervalRef.current);
+      }
+    };
+  }, []);
+
+  // Simple color detection for basic pink/magenta detection
+  const isPinkish = (r, g, b) => {
+    // Very simple check - red dominant, not too dark, not too bright
+    return (
+      r > 120 && // Minimum red
+      r > g + 30 && // Red significantly higher than green
+      r > b - 20 && // Red somewhat higher than blue
+      (r + g + b) > 250 && // Not too dark
+      (r + g + b) < 650 // Not too bright
+    );
+  };
+
+  // Add a gap pad marker manually by clicking
+  const addManualPadMarker = (event) => {
+    if (!captureMode || !canvasRef.current) return;
+    
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    
+    // Calculate the position in the canvas coordinates
+    const x = (event.clientX - rect.left) * scaleX;
+    const y = (event.clientY - rect.top) * scaleY;
+    
+    // Add the position as ratio (for resolution independence)
+    const newPos = {
+      x: x / canvas.width,
+      y: y / canvas.height,
+      id: Date.now() // Simple ID for tracking
+    };
+    
+    // Add to manual positions
+    setManualPositions([...manualPositions, newPos]);
+    
+    // Redraw canvas with all markers
+    redrawCanvasWithMarkers([...manualPositions, newPos]);
+    
+    setMessage(`Added gap pad marker ${manualPositions.length + 1}. Click on each gap pad location.`);
+  };
+
+  // Redraw canvas with current markers
+  const redrawCanvasWithMarkers = (positions) => {
+    if (!canvasRef.current || !videoRef.current) return;
+    
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const video = videoRef.current;
+    
+    // Redraw the video frame
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+    // Draw all markers
+    positions.forEach((pos, index) => {
+      const x = pos.x * canvas.width;
+      const y = pos.y * canvas.height;
+      
+      // Draw circle
+      ctx.beginPath();
+      ctx.arc(x, y, 20, 0, 2 * Math.PI);
+      ctx.strokeStyle = '#00ff00';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      
+      // Draw number
+      ctx.fillStyle = '#00ff00';
+      ctx.font = '16px Arial';
+      ctx.fillText((index + 1).toString(), x - 8, y + 5);
+    });
+  };
+
+  // Remove last marker
+  const removeLastMarker = () => {
+    if (manualPositions.length === 0) return;
+    
+    const newPositions = manualPositions.slice(0, -1);
+    setManualPositions(newPositions);
+    redrawCanvasWithMarkers(newPositions);
+    setMessage(`Removed marker. ${newPositions.length} markers remaining.`);
+  };
+
+  // Clear all markers
+  const clearAllMarkers = () => {
+    setManualPositions([]);
+    if (canvasRef.current && videoRef.current) {
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d');
+      canvas.width = videoRef.current.videoWidth;
+      canvas.height = videoRef.current.videoHeight;
+      ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+    }
+    setMessage("All markers cleared.");
+  };
+
+  const captureReferenceImage = async () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+
+    if (manualPositions.length === 0) {
+      setMessage("Please click on gap pad locations first");
+      return;
+    }
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    
+    if (!video || !canvas) return;
+    
+    // Capture clean image without markers
+    const context = canvas.getContext('2d');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+    const imageData = canvas.toDataURL('image/jpeg');
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    
+    // Save the reference image with manual positions
+    const updatedImages = {
+      ...referenceImages,
+      [key]: {
+        imageData,
+        timestamp: new Date().toISOString(),
+        serial: serial.trim().toUpperCase(),
+        side,
+        padPositions: manualPositions
+      }
+    };
+    
+    setReferenceImages(updatedImages);
+    localStorage.setItem('gapPadReferenceImages', JSON.stringify(updatedImages));
+    setMessage(`Reference saved with ${manualPositions.length} gap pad locations marked`);
+    setCaptureMode(false);
+    setManualPositions([]);
+  };
+
+  const validateCurrentView = async () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+    
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    
+    if (!referenceImages[key]) {
+      setMessage(`No reference image found for ${serial} (${side})`);
+      return;
+    }
+    
+    const refImage = referenceImages[key];
+    
+    if (!refImage.padPositions || refImage.padPositions.length === 0) {
+      setMessage("No gap pad positions found in reference. Please recapture.");
+      return;
+    }
+    
+    setValidationResult({
+      referenceImage: refImage.imageData,
+      timestamp: refImage.timestamp,
+      padPositions: refImage.padPositions
+    });
+    
+    setShowOverlay(true);
+    setMessage("Analyzing gap pad placement...");
+    
+    // Start continuous validation
+    if (validationIntervalRef.current) {
+      clearInterval(validationIntervalRef.current);
+    }
+    
+    validationIntervalRef.current = setInterval(() => {
+      if (!videoRef.current || !canvasRef.current || !showOverlay) {
+        return;
+      }
+      
+      // Capture current frame for analysis
+      const video = videoRef.current;
+      const canvas = document.createElement('canvas'); // Use temp canvas for analysis
+      const context = canvas.getContext('2d');
+      
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      
+      // Get frame data for analysis
+      const frameData = context.getImageData(0, 0, canvas.width, canvas.height);
+      const data = frameData.data;
+      
+      // Check each reference position for pink/magenta color
+      const referencePositions = refImage.padPositions || [];
+      let matchedCount = 0;
+      
+      referencePositions.forEach(refPad => {
+        // Calculate pixel coordinates
+        const checkX = Math.floor(refPad.x * canvas.width);
+        const checkY = Math.floor(refPad.y * canvas.height);
+        
+        // Check area around expected position
+        const searchRadius = 30; // pixels
+        let foundPinkish = false;
+        let pinkPixelCount = 0;
+        
+        for (let dy = -searchRadius; dy <= searchRadius; dy += 3) {
+          for (let dx = -searchRadius; dx <= searchRadius; dx += 3) {
+            const x = checkX + dx;
+            const y = checkY + dy;
+            
+            if (x >= 0 && y >= 0 && x < canvas.width && y < canvas.height) {
+              const index = (y * canvas.width + x) * 4;
+              const r = data[index];
+              const g = data[index + 1];
+              const b = data[index + 2];
+              
+              if (isPinkish(r, g, b)) {
+                pinkPixelCount++;
+              }
+            }
+          }
+        }
+        
+        // If we found enough pink pixels in the area, consider it a match
+        if (pinkPixelCount > 20) // Threshold for detection
+          foundPinkish = true;
+          matchedCount++;
+        
+      });
+      
+      // Calculate match percentage
+      const matchPercentage = referencePositions.length > 0 
+        ? (matchedCount / referencePositions.length) * 100 
+        : 0;
+      
+      // Update validation status
+      let status;
+      if (matchPercentage >= 80) {
+        status = "success";
+      } else if (matchPercentage >= 60) {
+        status = "warning";
+      } else {
+        status = "error";
+      }
+      
+      setValidationStatus({
+        status,
+        matchPercentage,
+        matchedCount,
+        totalCount: referencePositions.length
+      });
+      
+      // Update message
+      if (status === "success") {
+        setMessage(`✅ Validation PASSED! ${matchedCount}/${referencePositions.length} gap pads detected correctly.`);
+      } else if (status === "warning") {
+        setMessage(`⚠️ Some issues detected (${matchedCount}/${referencePositions.length} gap pads found).`);
+      } else {
+        setMessage(`❌ Validation FAILED (${matchedCount}/${referencePositions.length} gap pads found).`);
+      }
+    }, 1000); // Check every second
+  };
+
+  const stopValidation = () => {
+    if (validationIntervalRef.current) {
+      clearInterval(validationIntervalRef.current);
+    }
+    setShowOverlay(false);
+    setValidationStatus(null);
+  };
+
+  const deleteReferenceImage = () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+    
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    
+    if (!referenceImages[key]) {
+      setMessage(`No reference image found for ${serial} (${side})`);
+      return;
+    }
+    
+    const updatedImages = { ...referenceImages };
+    delete updatedImages[key];
+    
+    setReferenceImages(updatedImages);
+    localStorage.setItem('gapPadReferenceImages', JSON.stringify(updatedImages));
+    setMessage(`Reference image deleted for ${serial} (${side})`);
+    
+    if (validationResult) {
+      stopValidation();
+    }
+  };
+
+  const hasReferenceImage = () => {
+    if (!serial.trim()) return false;
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    return !!referenceImages[key];
+  };
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#0a0a0a", color:"#e5e5e5", display:"flex", flexDirection:"column" }}>
+      <header style={{ padding:"1rem", borderBottom:"1px solid #27272a" }}>
+        <div style={{ fontSize: "1.5rem", fontWeight: "bold" }}>Gap Pad Validator</div>
+        <div style={{ fontSize: "0.9rem", color: "#a1a1aa" }}>Simple and reliable gap pad placement validation</div>
+      </header>
+
+      <main style={{ flex:1, display:"grid", gridTemplateColumns:"2fr 1fr" }}>
+        <section style={{ padding:"1rem" }}>
+          {/* Instructions Panel */}
+          {showInstructions && (
+            <div style={{ 
+              background:"rgba(34, 197, 94, 0.1)", 
+              border: "1px solid rgba(34, 197, 94, 0.3)",
+              padding:"1rem", 
+              borderRadius:"8px", 
+              marginBottom: "1rem"
+            }}>
+              <div style={{ fontSize: "1rem", fontWeight: "bold", color: "#22c55e", marginBottom: "0.5rem" }}>
+                📋 How to Use:
+              </div>
+              <div style={{ fontSize: "0.9rem", lineHeight: "1.5" }}>
+                <strong>1. Create Reference:</strong> Enter serial → "Set Reference Image" → Click on each gap pad location → "Capture Reference"<br/>
+                <strong>2. Validate Units:</strong> Enter same serial → "Enter Validation Mode" → "Compare with Reference"<br/>
+                <strong>3. Results:</strong> Green = PASS, Yellow = CHECK, Red = FAIL
+              </div>
+              <button 
+                onClick={() => setShowInstructions(false)}
+                style={{ marginTop: "0.5rem", background: "transparent", border: "1px solid #22c55e", color: "#22c55e", padding: "4px 8px", borderRadius: "4px", fontSize: "0.8rem" }}
+              >
+                Got it!
+              </button>
+            </div>
+          )}
+
+          <div style={{ position:"relative", background:"black", borderRadius:"12px", overflow:"hidden" }}>
+            <video 
+              ref={videoRef} 
+              style={{ 
+                width:"100%", 
+                aspectRatio:"16/9", 
+                objectFit:"contain", 
+                display: showOverlay ? "none" : "block" 
+              }} 
+              playsInline 
+              autoPlay 
+              muted 
+            />
+            
+            {/* Manual marker canvas for capture mode */}
+            {captureMode && (
+              <canvas
+                ref={canvasRef}
+                onClick={addManualPadMarker}
+                style={{ 
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%", 
+                  height: "100%", 
+                  objectFit: "contain",
+                  cursor: 'crosshair'
+                }}
+              />
+            )}
+            
+            {/* Validation overlay */}
+            {showOverlay && validationResult && (
+              <div style={{ width:"100%", aspectRatio:"16/9", position:"relative" }}>
+                <img 
+                  src={validationResult.referenceImage} 
+                  alt="Reference" 
+                  style={{ width:"100%", height:"100%", objectFit:"contain", opacity:0.7 }} 
+                />
+                <video 
+                  ref={videoRef} 
+                  style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%", objectFit:"contain", opacity:0.5, mixBlendMode:"difference" }} 
+                  playsInline 
+                  autoPlay 
+                  muted 
+                />
+                
+                {/* Draw reference pad position markers */}
+                {validationResult.padPositions && validationResult.padPositions.map((pad, index) => (
+                  <div
+                    key={index}
+                    style={{
+                      position: "absolute",
+                      left: `${pad.x * 100}%`,
+                      top: `${pad.y * 100}%`,
+                      width: "40px",
+                      height: "40px",
+                      borderRadius: "50%",
+                      border: "3px solid #00ff00",
+                      transform: "translate(-50%, -50%)",
+                      pointerEvents: "none",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      color: "#00ff00",
+                      fontWeight: "bold",
+                      fontSize: "14px",
+                      background: "rgba(0,0,0,0.5)"
+                    }}
+                  >
+                    {index + 1}
+                  </div>
+                ))}
+                
+                {/* Validation status indicator */}
+                {validationStatus && (
+                  <div 
+                    style={{ 
+                      position:"absolute", 
+                      top:"20px", 
+                      left:"20px", 
+                      background: validationStatus.status === "success" ? "rgba(34, 197, 94, 0.9)" : 
+                                 validationStatus.status === "warning" ? "rgba(245, 158, 11, 0.9)" : 
+                                 "rgba(239, 68, 68, 0.9)",
+                      padding:"16px 20px", 
+                      borderRadius:"8px",
+                      fontSize: "18px",
+                      fontWeight: "bold",
+                      boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+                      zIndex: 10
+                    }}
+                  >
+                    {validationStatus.status === "success" ? "✅ PASS" : 
+                     validationStatus.status === "warning" ? "⚠️ CHECK" : "❌ FAIL"}
+                     <div style={{ fontSize: "14px", fontWeight: "normal", marginTop: "4px" }}>
+                       {validationStatus.matchedCount}/{validationStatus.totalCount} gap pads detected ({Math.round(validationStatus.matchPercentage)}%)
+                     </div>
+                  </div>
+                )}
+                
+                <button 
+                  style={{ position:"absolute", top:"20px", right:"20px", background:"#ef4444", padding:"12px 16px", borderRadius:"8px", border:"none", color:"white", fontSize: "16px", fontWeight: "bold" }}
+                  onClick={stopValidation}
+                >
+                  Exit Validation
+                </button>
+              </div>
+            )}
+            
+            {/* Mode indicators */}
+            {captureMode && !showOverlay && (
+              <div style={{ position:"absolute", top:"15px", left:"15px", background:"rgba(34, 197, 94, 0.8)", padding:"8px 12px", borderRadius:"8px", color:"white", fontWeight: "bold" }}>
+                📍 Click on each gap pad location ({manualPositions.length} marked)
+              </div>
+            )}
+            
+            {validationMode && !showOverlay && !captureMode && (
+              <div style={{ position:"absolute", top:"15px", left:"15px", background:"rgba(59, 130, 246, 0.8)", padding:"8px 12px", borderRadius:"8px", color:"white", fontWeight: "bold" }}>
+                🔍 Validation Mode Ready
+              </div>
+            )}
+          </div>
+          
+          {/* Control Buttons */}
+          <div style={{ marginTop:"1rem", display:"flex", gap:"0.5rem", flexWrap:"wrap" }}>
+            {validationMode ? (
+              <>
+                <button 
+                  onClick={() => setValidationMode(false)}
+                  style={{ background: "#6b7280", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px" }}
+                >
+                  Exit Validation Mode
+                </button>
+                <button 
+                  onClick={validateCurrentView} 
+                  style={{ background: "#3b82f6", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px", fontWeight: "bold" }}
+                  disabled={!hasReferenceImage()}
+                >
+                  🔍 Compare with Reference
+                </button>
+              </>
+            ) : captureMode ? (
+              <>
+                <button 
+                  onClick={() => {setCaptureMode(false); setManualPositions([]);}}
+                  style={{ background: "#6b7280", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px" }}
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={removeLastMarker}
+                  style={{ background: "#f59e0b", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px" }}
+                  disabled={manualPositions.length === 0}
+                >
+                  ↶ Undo Last
+                </button>
+                <button 
+                  onClick={clearAllMarkers}
+                  style={{ background: "#ef4444", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px" }}
+                  disabled={manualPositions.length === 0}
+                >
+                  🗑️ Clear All
+                </button>
+                <button 
+                  onClick={captureReferenceImage}
+                  style={{ background: "#22c55e", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px", fontWeight: "bold" }}
+                  disabled={manualPositions.length === 0}
+                >
+                  💾 Save Reference ({manualPositions.length} pads)
+                </button>
+              </>
+            ) : (
+              <>
+                <button 
+                  onClick={() => setValidationMode(true)}
+                  style={{ background: "#3b82f6", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px", fontWeight: "bold" }}
+                >
+                  🔍 Enter Validation Mode
+                </button>
+                <button 
+                  onClick={() => setCaptureMode(true)}
+                  style={{ background: "#22c55e", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px", fontWeight: "bold" }}
+                >
+                  📍 Set Reference Image
+                </button>
+              </>
+            )}
+          </div>
+          
+          {/* Message Display */}
+          {message && (
+            <div style={{ 
+              marginTop:"1rem", 
+              padding:"1rem", 
+              background: message.includes("PASSED") || message.includes("saved") ? "rgba(34, 197, 94, 0.2)" : 
+                        message.includes("FAILED") || message.includes("incorrect") ? "rgba(239, 68, 68, 0.2)" : 
+                        message.includes("issues") ? "rgba(245, 158, 11, 0.2)" :
+                        "rgba(107, 114, 128, 0.2)", 
+              borderRadius:"8px", 
+              fontSize:"1rem",
+              fontWeight: "500"
+            }}>
+              {message}
+            </div>
+          )}
+        </section>
+
+        <aside style={{ padding:"1rem", borderLeft:"1px solid #27272a" }}>
+          <div>
+            <label style={{ fontSize: "0.9rem", fontWeight: "600" }}>Serial Number</label><br/>
+            <input 
+              value={serial} 
+              onChange={e => setSerial(e.target.value)} 
+              placeholder="Enter serial number" 
+              style={{ width:"100%", padding:"12px", marginTop:"8px", background:"#1f2937", border:"1px solid #374151", color:"#e5e7eb", borderRadius:"6px", fontSize: "16px" }} 
+            />
+          </div>
+          
+          <div style={{ marginTop:"1.5rem" }}>
+            <label style={{ fontSize: "0.9rem", fontWeight: "600" }}>Gap Pad Side</label><br/>
+            <div style={{ display:"flex", gap:"0.5rem", marginTop:"8px" }}>
+              <button 
+                onClick={() => setSide("back")} 
+                style={{ 
+                  padding:"12px 20px", 
+                  background: side === "back" ? "#3b82f6" : "#374151",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "6px",
+                  fontSize: "14px",
+                  fontWeight: "600",
+                  flex: 1
+                }}
+              >
+                Back Side
+              </button>
+              <button 
+                onClick={() => setSide("front")} 
+                style={{ 
+                  padding:"12px 20px", 
+                  background: side === "front" ? "#3b82f6" : "#374151",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "6px",
+                  fontSize: "14px",
+                  fontWeight: "600",
+                  flex: 1
+                }}
+              >
+                Front Side
+              </button>
+            </div>
+          </div>
+          
+          <div style={{ marginTop:"1.5rem", fontSize:"0.9rem", color:"#9ca3af", background: "#1f2937", padding: "12px", borderRadius: "6px" }}>
+            <strong>Product:</strong> {(serial||"Unknown").slice(0,6).toUpperCase()} ({side})
+          </div>
+          
+          {hasReferenceImage() && (
+            <div style={{ marginTop:"1.5rem", background: "#065f46", padding: "16px", borderRadius: "8px" }}>
+              <div style={{ fontSize:"0.9rem", marginBottom:"8px", color:"#10b981", fontWeight: "600" }}>
+                ✅ Reference Available
+              </div>
+              
+              {referenceImages[`${serial.trim().toUpperCase()}_${side}`]?.padPositions && (
+                <div style={{ fontSize:"0.85rem", marginBottom:"12px", color:"#6ee7b7" }}>
+                  📍 {referenceImages[`${serial.trim().toUpperCase()}_${side}`].padPositions.length} gap pad locations saved
+                </div>
+              )}
+              
+              <div style={{ display: "flex", gap: "8px", flexDirection: "column" }}>
+                <button 
+                  onClick={() => {
+                    const key = `${serial.trim().toUpperCase()}_${side}`;
+                    if (referenceImages[key]) {
+                      setValidationResult({
+                        referenceImage: referenceImages[key].imageData,
+                        timestamp: referenceImages[key].timestamp,
+                        padPositions: referenceImages[key].padPositions || []
+                      });
+                      setShowOverlay(true);
+                      setValidationStatus(null);
+                    }
+                  }}
+                  style={{ background:"#047857", border:"none", padding:"8px 12px", borderRadius:"6px", fontSize:"0.85rem", color: "white", fontWeight: "600" }}
+                >
+                  👁️ Preview Reference
+                </button>
+                <button 
+                  onClick={deleteReferenceImage}
+                  style={{ background:"#dc2626", color:"white", border:"none", padding:"8px 12px", borderRadius:"6px", fontSize:"0.85rem", fontWeight: "600" }}
+                >
+                  🗑️ Delete Reference
+                </button>
+              </div>
+            </div>
+          )}
+          
+          <div style={{ marginTop:"2rem", fontSize:"0.85rem", color:"#9ca3af", background: "#1f2937", padding: "12px", borderRadius: "6px" }}>
+            <div style={{ fontWeight: "600", marginBottom: "8px" }}>📚 Reference Library</div>
+            <div>{Object.keys(referenceImages).length} reference images stored</div>
+            
+            {Object.keys(referenceImages).length > 0 && (
+              <button
+                onClick={() => {
+                  localStorage.removeItem('gapPadReferenceImages');
+                  setReferenceImages({});
+                  setMessage("All references cleared");
+                }}
+                style={{ background:"#dc2626", color:"white", border:"none", padding:"6px 10px", borderRadius:"4px", fontSize:"0.75rem", marginTop: "8px" }}
+              >
+                Clear All References
+              </button>
+            )}
+          </div>
+          
+          <div style={{ marginTop:"1.5rem", fontSize:"0.8rem", color:"#6b7280", borderTop:"1px solid #374151", paddingTop:"1rem" }}>
+            <div style={{ fontWeight: "600", marginBottom: "8px" }}>💡 Tips for Best Results:</div>
+            <ul style={{ paddingLeft: "16px", lineHeight: "1.6" }}>
+              <li>Ensure good lighting when capturing reference</li>
+              <li>Mark gap pads in consistent order</li>
+              <li>Hold device steady during validation</li>
+              <li>Ensure gap pads are clearly visible</li>
+            </ul>
+          </div>
+        </aside>
+      </main>
+    </div>
+  );
+}

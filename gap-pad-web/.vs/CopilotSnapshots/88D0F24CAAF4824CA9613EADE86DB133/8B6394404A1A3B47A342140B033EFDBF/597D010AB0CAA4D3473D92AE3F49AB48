@@ -1,0 +1,61 @@
+﻿
+import React, { useRef, useState, useEffect } from "react";
+
+export default function App() {
+  const videoRef = useRef(null);
+  const [serial, setSerial] = useState("");
+  const [side, setSide] = useState("back");
+  const [validationMode, setValidationMode] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play();
+        }
+      } catch (err) {
+        console.error("Camera error", err);
+      }
+    })();
+  }, []);
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#0a0a0a", color:"#e5e5e5", display:"flex", flexDirection:"column" }}>
+      <header style={{ padding:"1rem", borderBottom:"1px solid #27272a" }}>
+        <div>Gap Pad Web Validator</div>
+      </header>
+
+      <main style={{ flex:1, display:"grid", gridTemplateColumns:"2fr 1fr" }}>
+        <section style={{ padding:"1rem" }}>
+          <div style={{ position:"relative", background:"black", borderRadius:"12px", overflow:"hidden" }}>
+            <video ref={videoRef} style={{ width:"100%", aspectRatio:"16/9", objectFit:"contain" }} playsInline autoPlay muted />
+            {validationMode && (
+              <div style={{ position:"absolute", top:"10px", left:"10px", background:"rgba(0,0,0,0.6)", padding:"4px 8px", borderRadius:"8px" }}>
+                Validation Overlay Active
+              </div>
+            )}
+          </div>
+          <button style={{ marginTop:"1rem" }} onClick={() => setValidationMode(v => !v)}>
+            {validationMode ? "Exit Validation Mode" : "Enter Validation Mode"}
+          </button>
+        </section>
+
+        <aside style={{ padding:"1rem", borderLeft:"1px solid #27272a" }}>
+          <div>
+            <label>Serial Number</label><br/>
+            <input value={serial} onChange={e => setSerial(e.target.value)} placeholder="Enter serial" style={{ width:"100%", padding:"8px", marginTop:"4px" }} />
+          </div>
+          <div style={{ marginTop:"1rem" }}>
+            <button onClick={()=>setSide("back")} style={{ marginRight:"0.5rem" }}>Back</button>
+            <button onClick={()=>setSide("front")}>Front</button>
+          </div>
+          <div style={{ marginTop:"1rem", fontSize:"0.8rem", color:"#a1a1aa" }}>
+            Product code: {(serial||"").slice(0,6).toUpperCase()} ({side})
+          </div>
+        </aside>
+      </main>
+    </div>
+  );
+}

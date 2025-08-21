@@ -1,0 +1,311 @@
+﻿import React, { useRef, useState, useEffect } from "react";
+
+export default function App() {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const [serial, setSerial] = useState("");
+  const [side, setSide] = useState("back");
+  const [validationMode, setValidationMode] = useState(false);
+  const [referenceImages, setReferenceImages] = useState({});
+  const [captureMode, setCaptureMode] = useState(false);
+  const [validationResult, setValidationResult] = useState(null);
+  const [showOverlay, setShowOverlay] = useState(false);
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    // Load saved reference images from localStorage on component mount
+    const savedImages = localStorage.getItem('gapPadReferenceImages');
+    if (savedImages) {
+      setReferenceImages(JSON.parse(savedImages));
+    }
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play();
+        }
+      } catch (err) {
+        console.error("Camera error", err);
+        setMessage("Camera access error. Please check permissions.");
+      }
+    })();
+  }, []);
+
+  const captureReferenceImage = () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    
+    if (!video || !canvas) return;
+    
+    const context = canvas.getContext('2d');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+    const imageData = canvas.toDataURL('image/jpeg');
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    
+    // Save the reference image
+    const updatedImages = {
+      ...referenceImages,
+      [key]: {
+        imageData,
+        timestamp: new Date().toISOString(),
+        serial: serial.trim().toUpperCase(),
+        side
+      }
+    };
+    
+    setReferenceImages(updatedImages);
+    localStorage.setItem('gapPadReferenceImages', JSON.stringify(updatedImages));
+    setMessage(`Reference image saved for ${serial} (${side})`);
+    setCaptureMode(false);
+  };
+
+  const validateCurrentView = () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+    
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    
+    if (!referenceImages[key]) {
+      setMessage(`No reference image found for ${serial} (${side})`);
+      return;
+    }
+    
+    setValidationResult({
+      referenceImage: referenceImages[key].imageData,
+      timestamp: referenceImages[key].timestamp
+    });
+    
+    setShowOverlay(true);
+    setMessage("Compare current view with the reference image");
+  };
+
+  const deleteReferenceImage = () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+    
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    
+    if (!referenceImages[key]) {
+      setMessage(`No reference image found for ${serial} (${side})`);
+      return;
+    }
+    
+    const updatedImages = { ...referenceImages };
+    delete updatedImages[key];
+    
+    setReferenceImages(updatedImages);
+    localStorage.setItem('gapPadReferenceImages', JSON.stringify(updatedImages));
+    setMessage(`Reference image deleted for ${serial} (${side})`);
+    
+    if (validationResult) {
+      setValidationResult(null);
+      setShowOverlay(false);
+    }
+  };
+
+  const hasReferenceImage = () => {
+    if (!serial.trim()) return false;
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    return !!referenceImages[key];
+  };
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#0a0a0a", color:"#e5e5e5", display:"flex", flexDirection:"column" }}>
+      <header style={{ padding:"1rem", borderBottom:"1px solid #27272a" }}>
+        <div>Gap Pad Web Validator</div>
+      </header>
+
+      <main style={{ flex:1, display:"grid", gridTemplateColumns:"2fr 1fr" }}>
+        <section style={{ padding:"1rem" }}>
+          <div style={{ position:"relative", background:"black", borderRadius:"12px", overflow:"hidden" }}>
+            <video ref={videoRef} style={{ width:"100%", aspectRatio:"16/9", objectFit:"contain", display: showOverlay ? "none" : "block" }} playsInline autoPlay muted />
+            
+            {showOverlay && validationResult && (
+              <div style={{ width:"100%", aspectRatio:"16/9", position:"relative" }}>
+                <img 
+                  src={validationResult.referenceImage} 
+                  alt="Reference" 
+                  style={{ width:"100%", height:"100%", objectFit:"contain", opacity:0.7 }} 
+                />
+                <video 
+                  ref={videoRef} 
+                  style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%", objectFit:"contain", opacity:0.7, mixBlendMode:"difference" }} 
+                  playsInline 
+                  autoPlay 
+                  muted 
+                />
+                <div style={{ position:"absolute", bottom:"10px", left:"10px", background:"rgba(0,0,0,0.7)", padding:"8px", borderRadius:"4px", fontSize:"12px" }}>
+                  Reference captured: {new Date(validationResult.timestamp).toLocaleString()}
+                </div>
+                <button 
+                  style={{ position:"absolute", top:"10px", right:"10px", background:"#e11d48", padding:"8px", borderRadius:"4px", border:"none", color:"white" }}
+                  onClick={() => setShowOverlay(false)}
+                >
+                  Exit Overlay
+                </button>
+              </div>
+            )}
+            
+            <canvas ref={canvasRef} style={{ display: "none" }} />
+            
+            {validationMode && !showOverlay && (
+              <div style={{ position:"absolute", top:"10px", left:"10px", background:"rgba(0,0,0,0.6)", padding:"4px 8px", borderRadius:"8px" }}>
+                Validation Mode Active
+              </div>
+            )}
+            
+            {captureMode && !showOverlay && (
+              <div style={{ position:"absolute", top:"10px", left:"10px", background:"rgba(0,0,0,0.6)", padding:"4px 8px", borderRadius:"8px", color:"#f87171" }}>
+                Capture Mode Active
+              </div>
+            )}
+          </div>
+          
+          <div style={{ marginTop:"1rem", display:"flex", gap:"0.5rem", flexWrap:"wrap" }}>
+            {validationMode ? (
+              <>
+                <button onClick={() => setValidationMode(false)}>
+                  Exit Validation Mode
+                </button>
+                <button 
+                  onClick={validateCurrentView} 
+                  style={{ background: "#2563eb", color: "white", border: "none", padding: "8px 16px", borderRadius: "4px" }}
+                  disabled={!hasReferenceImage()}
+                >
+                  Compare with Reference
+                </button>
+              </>
+            ) : captureMode ? (
+              <>
+                <button onClick={() => setCaptureMode(false)}>
+                  Cancel Capture
+                </button>
+                <button 
+                  onClick={captureReferenceImage}
+                  style={{ background: "#16a34a", color: "white", border: "none", padding: "8px 16px", borderRadius: "4px" }}
+                >
+                  Capture Reference Image
+                </button>
+              </>
+            ) : (
+              <>
+                <button onClick={() => setValidationMode(true)}>
+                  Enter Validation Mode
+                </button>
+                <button onClick={() => setCaptureMode(true)}>
+                  Set Reference Image
+                </button>
+              </>
+            )}
+          </div>
+          
+          {message && (
+            <div style={{ marginTop:"0.75rem", padding:"0.5rem", background:"rgba(0,0,0,0.4)", borderRadius:"4px", fontSize:"0.9rem" }}>
+              {message}
+            </div>
+          )}
+        </section>
+
+        <aside style={{ padding:"1rem", borderLeft:"1px solid #27272a" }}>
+          <div>
+            <label>Serial Number</label><br/>
+            <input 
+              value={serial} 
+              onChange={e => setSerial(e.target.value)} 
+              placeholder="Enter serial" 
+              style={{ width:"100%", padding:"8px", marginTop:"4px", background:"#1f1f1f", border:"1px solid #3f3f3f", color:"#e5e5e5", borderRadius:"4px" }} 
+            />
+          </div>
+          
+          <div style={{ marginTop:"1rem" }}>
+            <label>Gap Pad Side</label><br/>
+            <div style={{ display:"flex", gap:"0.5rem", marginTop:"4px" }}>
+              <button 
+                onClick={() => setSide("back")} 
+                style={{ 
+                  padding:"8px 16px", 
+                  background: side === "back" ? "#2563eb" : "#1f1f1f",
+                  color: side === "back" ? "white" : "#e5e5e5",
+                  border: "none",
+                  borderRadius: "4px"
+                }}
+              >
+                Back
+              </button>
+              <button 
+                onClick={() => setSide("front")} 
+                style={{ 
+                  padding:"8px 16px", 
+                  background: side === "front" ? "#2563eb" : "#1f1f1f",
+                  color: side === "front" ? "white" : "#e5e5e5",
+                  border: "none",
+                  borderRadius: "4px"
+                }}
+              >
+                Front
+              </button>
+            </div>
+          </div>
+          
+          <div style={{ marginTop:"1rem", fontSize:"0.8rem", color:"#a1a1aa" }}>
+            Product code: {(serial||"").slice(0,6).toUpperCase()} ({side})
+          </div>
+          
+          {hasReferenceImage() && (
+            <div style={{ marginTop:"1rem" }}>
+              <div style={{ fontSize:"0.8rem", marginBottom:"0.5rem", color:"#34d399" }}>
+                ✓ Reference image available
+              </div>
+              <button 
+                onClick={deleteReferenceImage}
+                style={{ background:"#ef4444", color:"white", border:"none", padding:"4px 8px", borderRadius:"4px", fontSize:"0.8rem" }}
+              >
+                Delete Reference
+              </button>
+              <div style={{ marginTop:"0.5rem" }}>
+                <button 
+                  onClick={() => {
+                    const key = `${serial.trim().toUpperCase()}_${side}`;
+                    if (referenceImages[key]) {
+                      setValidationResult({
+                        referenceImage: referenceImages[key].imageData,
+                        timestamp: referenceImages[key].timestamp
+                      });
+                      setShowOverlay(true);
+                    }
+                  }}
+                  style={{ background:"#1f1f1f", border:"none", padding:"4px 8px", borderRadius:"4px", fontSize:"0.8rem" }}
+                >
+                  View Reference
+                </button>
+              </div>
+            </div>
+          )}
+          
+          <div style={{ marginTop:"1.5rem", fontSize:"0.8rem", color:"#a1a1aa", borderTop:"1px solid #27272a", paddingTop:"1rem" }}>
+            <div>Reference Library:</div>
+            <div style={{ fontSize:"0.7rem", marginTop:"0.5rem" }}>
+              {Object.keys(referenceImages).length} images stored
+            </div>
+          </div>
+        </aside>
+      </main>
+    </div>
+  );
+}

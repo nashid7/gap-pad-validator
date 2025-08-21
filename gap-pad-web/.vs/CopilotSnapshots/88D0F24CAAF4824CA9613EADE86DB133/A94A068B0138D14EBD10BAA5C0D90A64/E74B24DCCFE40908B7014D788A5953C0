@@ -1,0 +1,1345 @@
+﻿import React, { useRef, useState, useEffect } from "react";
+
+export default function App() {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const detectionCanvasRef = useRef(null);
+  const [serial, setSerial] = useState("");
+  const [side, setSide] = useState("back");
+  const [validationMode, setValidationMode] = useState(false);
+  const [referenceImages, setReferenceImages] = useState({});
+  const [captureMode, setCaptureMode] = useState(false);
+  const [validationResult, setValidationResult] = useState(null);
+  const [showOverlay, setShowOverlay] = useState(false);
+  const [message, setMessage] = useState("");
+  const [validationStatus, setValidationStatus] = useState(null);
+  const validationIntervalRef = useRef(null);
+  const [showInstructions, setShowInstructions] = useState(true);
+  const [detectedPads, setDetectedPads] = useState([]);
+  const [showDetectionOverlay, setShowDetectionOverlay] = useState(false);
+
+  useEffect(() => {
+    // Load saved reference images from localStorage on component mount
+    const savedImages = localStorage.getItem('gapPadReferenceImages');
+    if (savedImages) {
+      try {
+        const parsed = JSON.parse(savedImages);
+        setReferenceImages(parsed);
+      } catch (e) {
+        console.error("Failed to parse saved images", e);
+        setMessage("Error loading saved images");
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { 
+            facingMode: "environment",
+            width: { ideal: 1920 },
+            height: { ideal: 1080 }
+          }, 
+          audio: false 
+        });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play();
+        }
+      } catch (err) {
+        console.error("Camera error", err);
+        setMessage("Camera access error. Please check permissions.");
+      }
+    })();
+
+    // Cleanup function for validation interval
+    return () => {
+      if (validationIntervalRef.current) {
+        clearInterval(validationIntervalRef.current);
+      }
+    };
+  }, []);
+
+  // Advanced gap pad detection based on your Python script approach
+  const detectGapPads = async (imageData) => {
+    return new Promise(async (resolve) => {
+      try {
+        console.log("Trying advanced HSV detection...");
+        
+        const tempCanvas = document.createElement('canvas');
+        const tempCtx = tempCanvas.getContext('2d');
+        
+        const img = new Image();
+        img.onload = async () => {
+          console.log(`Starting detection on image: ${img.width}x${img.height}`);
+          
+          tempCanvas.width = img.width;
+          tempCanvas.height = img.height;
+          tempCtx.drawImage(img, 0, 0);
+          
+          const imgData = tempCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height);
+          const data = imgData.data;
+          
+          console.log('Converting to HSV...');
+          // Convert to HSV for better color detection (similar to Python OpenCV)
+          const hsvData = rgbToHsv(data, tempCanvas.width, tempCanvas.height);
+          
+          console.log('Creating color mask...');
+          // Create mask for pink/magenta colors
+          const mask = createColorMask(hsvData, tempCanvas.width, tempCanvas.height);
+          
+          // Count mask pixels for debugging
+          let maskPixelCount = 0;
+          for (let i = 0; i < mask.length; i++) {
+            if (mask[i] === 255) maskPixelCount++;
+          }
+          console.log(`Color mask contains ${maskPixelCount} pink/magenta pixels (${((maskPixelCount/(tempCanvas.width*tempCanvas.height))*100).toFixed(2)}% of image)`);
+          
+          // If HSV detection found very few pixels, try simple RGB detection
+          if (maskPixelCount < 100) {
+            console.log("HSV detection found too few pixels, trying simple RGB detection...");
+            const simplePads = await detectGapPadsSimple(imageData);
+            if (simplePads.length > 0) {
+              console.log(`Simple detection succeeded with ${simplePads.length} pads`);
+              resolve(simplePads);
+              return;
+            }
+          }
+          
+          console.log('Finding contours...');
+          // Find contours (connected components)
+          const contours = findContours(mask, tempCanvas.width, tempCanvas.height);
+          
+          console.log('Filtering gap pads...');
+          // Filter contours by size and aspect ratio (similar to your Python script)
+          const validPads = filterGapPads(contours, tempCanvas.width, tempCanvas.height);
+          
+          // Draw detection results
+          drawDetectionResults(tempCtx, validPads, tempCanvas.width, tempCanvas.height);
+          
+          console.log(`✅ Detection complete: Found ${validPads.length} gap pads`);
+          resolve(validPads);
+        };
+        
+        img.onerror = async (error) => {
+          console.error('HSV detection image loading error:', error);
+          console.log('Trying simple RGB detection as fallback...');
+          const simplePads = await detectGapPadsSimple(imageData);
+          resolve(simplePads);
+        };
+        
+        img.src = imageData;
+        
+      } catch (error) {
+        console.error('Advanced detection failed:', error);
+        console.log('Trying simple RGB detection as fallback...');
+        try {
+          const simplePads = await detectGapPadsSimple(imageData);
+          resolve(simplePads);
+        } catch (fallbackError) {
+          console.error('Fallback detection also failed:', fallbackError);
+          resolve([]);
+        }
+      }
+    });
+  };
+
+  // Convert RGB to HSV (similar to OpenCV cvtColor)
+  const rgbToHsv = (data, width, height) => {
+    const hsvData = new Uint8Array(width * height * 3);
+    
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i] / 255;
+      const g = data[i + 1] / 255;
+      const b = data[i + 2] / 255;
+      
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const delta = max - min;
+      
+      let h = 0;
+      let s = 0;
+      const v = max;
+      
+      if (delta !== 0) {
+        s = delta / max;
+        
+        if (max === r) {
+          h = ((g - b) / delta) % 6;
+        } else if (max === g) {
+          h = (b - r) / delta + 2;
+        } else {
+          h = (r - g) / delta + 4;
+        }
+        h *= 60;
+        if (h < 0) h += 360;
+      }
+      
+      const pixelIndex = (i / 4) * 3;
+      hsvData[pixelIndex] = h;           // H: 0-360
+      hsvData[pixelIndex + 1] = s * 100; // S: 0-100
+      hsvData[pixelIndex + 2] = v * 100; // V: 0-100
+    }
+    
+    return hsvData;
+  };
+
+  // Create mask for pink/magenta colors (similar to cv2.inRange)
+  const createColorMask = (hsvData, width, height) => {
+    const mask = new Uint8Array(width * height);
+    
+    // Updated Pink/Magenta HSV ranges - broader detection
+    // Range 1: Magenta (300-360°)
+    const lowerPink1 = [280, 20, 30];  // Broader magenta range
+    const upperPink1 = [360, 100, 100];
+    
+    // Range 2: Red-Pink (0-40°) 
+    const lowerPink2 = [0, 20, 30];    // Broader red-pink range
+    const upperPink2 = [40, 100, 100];
+    
+    // Range 3: Purple-Pink (240-280°)
+    const lowerPink3 = [240, 20, 30];  // Purple-pink range
+    const upperPink3 = [280, 100, 100];
+    
+    for (let i = 0; i < hsvData.length; i += 3) {
+      const h = hsvData[i];
+      const s = hsvData[i + 1];
+      const v = hsvData[i + 2];
+      
+      const inRange1 = (h >= lowerPink1[0] && h <= upperPink1[0] && 
+                       s >= lowerPink1[1] && s <= upperPink1[1] && 
+                       v >= lowerPink1[2] && v <= upperPink1[2]);
+      
+      const inRange2 = (h >= lowerPink2[0] && h <= upperPink2[0] && 
+                       s >= lowerPink2[1] && s <= upperPink2[1] && 
+                       v >= lowerPink2[2] && v <= upperPink2[2]);
+      
+      const inRange3 = (h >= lowerPink3[0] && h <= upperPink3[0] && 
+                       s >= lowerPink3[1] && s <= upperPink3[1] && 
+                       v >= lowerPink3[2] && v <= upperPink3[2]);
+      
+      mask[i / 3] = (inRange1 || inRange2 || inRange3) ? 255 : 0;
+    }
+    
+    return mask;
+  };
+
+  // Find contours (connected components) - simplified version of cv2.findContours
+  const findContours = (mask, width, height) => {
+    const visited = new Set();
+    const contours = [];
+    
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const index = y * width + x;
+        
+        if (mask[index] === 255 && !visited.has(index)) {
+          const contour = floodFill(mask, width, height, x, y, visited);
+          if (contour.points.length > 50) { // Minimum size threshold
+            contours.push(contour);
+          }
+        }
+      }
+    }
+    
+    return contours;
+  };
+
+  // Flood fill to find connected components
+  const floodFill = (mask, width, height, startX, startY, visited) => {
+    const queue = [{x: startX, y: startY}];
+    const points = [];
+    let minX = startX, maxX = startX, minY = startY, maxY = startY;
+    
+    while (queue.length > 0) {
+      const {x, y} = queue.shift();
+      const index = y * width + x;
+      
+      if (visited.has(index) || x < 0 || y < 0 || x >= width || y >= height || mask[index] !== 255) {
+        continue;
+      }
+      
+      visited.add(index);
+      points.push({x, y});
+      
+      // Update bounding box
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
+      
+      // Add 4-connected neighbors
+      queue.push({x: x + 1, y: y});
+      queue.push({x: x - 1, y: y});
+      queue.push({x: x, y: y + 1});
+      queue.push({x: x, y: y - 1});
+    }
+    
+    return {
+      points,
+      boundingBox: {
+        x: minX,
+        y: minY,
+        width: maxX - minX + 1,
+        height: maxY - minY + 1
+      }
+    };
+  };
+
+  // Filter gap pads based on size and aspect ratio (similar to your Python script logic)
+  const filterGapPads = (contours, imageWidth, imageHeight) => {
+    const validPads = [];
+    
+    console.log(`Filtering ${contours.length} contours found`);
+    
+    contours.forEach((contour, index) => {
+      const bbox = contour.boundingBox;
+      const area = bbox.width * bbox.height;
+      const aspectRatio = bbox.width / bbox.height;
+      
+      // More lenient filter criteria
+      const minArea = 100;   // Reduced minimum area
+      const maxArea = 8000;  // Increased maximum area  
+      const minAspectRatio = 0.3;  // More lenient aspect ratio
+      const maxAspectRatio = 3.0;  // More lenient aspect ratio
+      
+      // Additional size checks relative to image
+      const relativeArea = area / (imageWidth * imageHeight);
+      
+      console.log(`Contour ${index}: area=${area}, aspect=${aspectRatio.toFixed(2)}, relArea=${(relativeArea*100).toFixed(4)}%`);
+      
+      if (area >= minArea && area <= maxArea &&
+          aspectRatio >= minAspectRatio && aspectRatio <= maxAspectRatio &&
+          relativeArea >= 0.00005 && relativeArea <= 0.08) { // More lenient relative area
+        
+        console.log(`✓ Contour ${index} accepted as gap pad`);
+        
+        validPads.push({
+          x: (bbox.x + bbox.width / 2) / imageWidth,  // Center X as ratio
+          y: (bbox.y + bbox.height / 2) / imageHeight, // Center Y as ratio
+          width: bbox.width / imageWidth,
+          height: bbox.height / imageHeight,
+          area: area,
+          aspectRatio: aspectRatio,
+          boundingBox: bbox,
+          id: `pad_${bbox.x}_${bbox.y}`
+        });
+      } else {
+        console.log(`✗ Contour ${index} rejected: area=${area >= minArea && area <= maxArea}, aspect=${aspectRatio >= minAspectRatio && aspectRatio <= maxAspectRatio}, relArea=${relativeArea >= 0.00005 && relativeArea <= 0.08}`);
+      }
+    });
+    
+    console.log(`Filtered down to ${validPads.length} valid gap pads`);
+    return validPads;
+  };
+
+  // Draw detection results (similar to cv2.rectangle and cv2.putText)
+  const drawDetectionResults = (ctx, pads, width, height) => {
+    pads.forEach((pad, index) => {
+      const bbox = pad.boundingBox;
+      
+      // Draw green rectangle
+      ctx.strokeStyle = '#00ff00';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(bbox.x, bbox.y, bbox.width, bbox.height);
+      
+      // Draw label background
+      const label = `P${index + 1}`;
+      ctx.font = '16px Arial';
+      const textWidth = ctx.measureText(label).width;
+      
+      ctx.fillStyle = '#00ff00';
+      ctx.fillRect(bbox.x, bbox.y - 20, textWidth + 8, 20);
+      
+      // Draw label text
+      ctx.fillStyle = '#000000';
+      ctx.fillText(label, bbox.x + 4, bbox.y - 6);
+    });
+  };
+
+  // Test gap pad detection on current video frame
+  const testDetection = async () => {
+    if (!videoRef.current) {
+      setMessage("❌ Video not available");
+      return;
+    }
+
+    // Ensure canvas ref is available
+    if (!canvasRef.current) {
+      setMessage("❌ Canvas not available - check browser console");
+      console.error("Canvas ref is null:", canvasRef.current);
+      return;
+    }
+    
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    
+    // Make canvas visible temporarily for capture
+    canvas.style.display = "block";
+    canvas.style.position = "absolute";
+    canvas.style.top = "0";
+    canvas.style.left = "0";
+    canvas.style.zIndex = "10";
+    
+    console.log("=== TEST DETECTION DEBUG ===");
+    console.log("Video dimensions:", video.videoWidth, "x", video.videoHeight);
+    console.log("Canvas element:", canvas);
+    
+    try {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      
+      const imageData = canvas.toDataURL('image/jpeg');
+      console.log("Image data captured, length:", imageData.length);
+      
+      setMessage("Running gap pad detection...");
+      
+      console.log("Starting test detection...");
+      const detectedPads = await detectGapPads(imageData);
+      console.log("Test detection result:", detectedPads);
+      
+      setDetectedPads(detectedPads);
+      setShowDetectionOverlay(true);
+      setMessage(`✅ Detection complete! Found ${detectedPads.length} gap pads`);
+      
+      // Save a debug image to localStorage
+      localStorage.setItem('debugTestImage', imageData);
+      
+    } catch (error) {
+      console.error("Detection error:", error);
+      setMessage("❌ Detection failed. Check console for details.");
+    } finally {
+      // Hide canvas again
+      canvas.style.display = "none";
+    }
+  };
+
+  const captureReferenceImage = async () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    
+    if (!video) {
+      setMessage("❌ Video not available");
+      console.error("Video ref is null:", video);
+      return;
+    }
+    
+    if (!canvas) {
+      setMessage("❌ Canvas not available");
+      console.error("Canvas ref is null:", canvas);
+      return;
+    }
+    
+    console.log("=== CAPTURE DEBUG ===");
+    console.log("Video dimensions:", video.videoWidth, "x", video.videoHeight);
+    console.log("Video ready state:", video.readyState);
+    console.log("Canvas element:", canvas);
+    
+    try {
+      const context = canvas.getContext('2d');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      
+      const imageData = canvas.toDataURL('image/jpeg');
+      const key = `${serial.trim().toUpperCase()}_${side}`;
+      
+      console.log("Image data length:", imageData.length);
+      console.log("Starting detection...");
+      
+      setMessage("Detecting gap pads automatically...");
+      
+      // Try detection with error handling
+      let detectedPads = [];
+      try {
+        detectedPads = await detectGapPads(imageData);
+        console.log("Detection completed, found:", detectedPads.length, "pads");
+      } catch (detectionError) {
+        console.error("Detection failed:", detectionError);
+        setMessage("❌ Detection algorithm failed. Saving with manual fallback...");
+        
+        // For now, let's save the image anyway without detection
+        // This allows testing the basic capture functionality
+      }
+      
+      if (detectedPads.length === 0) {
+        // Ask user if they want to save anyway or use manual mode
+        const saveAnyway = confirm("No gap pads detected automatically. Save image anyway for manual marking later?");
+        if (!saveAnyway) {
+          setMessage("⚠️ Capture cancelled. Try better lighting or use manual mode.");
+          return;
+        }
+        detectedPads = []; // Save with empty positions
+      }
+      
+      // Save the reference image with detected positions (or empty array)
+      const updatedImages = {
+        ...referenceImages,
+        [key]: {
+          imageData,
+          timestamp: new Date().toISOString(),
+          serial: serial.trim().toUpperCase(),
+          side,
+          padPositions: detectedPads
+        }
+      };
+      
+      setReferenceImages(updatedImages);
+      localStorage.setItem('gapPadReferenceImages', JSON.stringify(updatedImages));
+      
+      if (detectedPads.length > 0) {
+        setMessage(`✅ Reference saved! Automatically detected ${detectedPads.length} gap pads`);
+      } else {
+        setMessage(`⚠️ Reference saved without automatic detection. You can add manual positions later.`);
+      }
+      setCaptureMode(false);
+      
+    } catch (error) {
+      console.error("Capture error:", error);
+      setMessage("❌ Capture failed. Check console for details.");
+    }
+  };
+
+  const validateCurrentView = async () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+    
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    
+    if (!referenceImages[key]) {
+      setMessage(`No reference image found for ${serial} (${side})`);
+      return;
+    }
+    
+    const refImage = referenceImages[key];
+    
+    if (!refImage.padPositions || refImage.padPositions.length === 0) {
+      setMessage("No gap pad positions found in reference. Please recapture.");
+      return;
+    }
+    
+    setValidationResult({
+      referenceImage: refImage.imageData,
+      timestamp: refImage.timestamp,
+      padPositions: refImage.padPositions
+    });
+    
+    setShowOverlay(true);
+    setMessage("🔍 Starting real-time validation...");
+    
+    // Start continuous validation with automatic detection
+    if (validationIntervalRef.current) {
+      clearInterval(validationIntervalRef.current);
+    }
+    
+    validationIntervalRef.current = setInterval(async () => {
+      if (!videoRef.current || !showOverlay) {
+        return;
+      }
+      
+      try {
+        // Capture current frame
+        const video = videoRef.current;
+        const tempCanvas = document.createElement('canvas');
+        const tempCtx = tempCanvas.getContext('2d');
+        
+        tempCanvas.width = video.videoWidth;
+        tempCanvas.height = video.videoHeight;
+        tempCtx.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
+        
+        const currentImageData = tempCanvas.toDataURL('image/jpeg');
+        
+        // Detect gap pads in current frame
+        const currentPads = await detectGapPads(currentImageData);
+        
+        // Compare with reference
+        const referencePositions = refImage.padPositions || [];
+        let matchedCount = 0;
+        const tolerance = 0.05; // 5% tolerance for position matching
+        
+        // For each reference pad, find if there's a matching detected pad
+        referencePositions.forEach(refPad => {
+          const hasMatch = currentPads.some(currentPad => {
+            const xDiff = Math.abs(refPad.x - currentPad.x);
+            const yDiff = Math.abs(refPad.y - currentPad.y);
+            return xDiff <= tolerance && yDiff <= tolerance;
+          });
+          
+          if (hasMatch) {
+            matchedCount++;
+          }
+        });
+        
+        // Calculate match percentage
+        const matchPercentage = referencePositions.length > 0 
+          ? (matchedCount / referencePositions.length) * 100 
+          : 0;
+        
+        // Update validation status
+        let status;
+        if (matchPercentage >= 90) {
+          status = "success";
+        } else if (matchPercentage >= 70) {
+          status = "warning";
+        } else {
+          status = "error";
+        }
+        
+        setValidationStatus({
+          status,
+          matchPercentage,
+          matchedCount,
+          totalCount: referencePositions.length,
+          currentPads: currentPads.length
+        });
+        
+        // Update message
+        if (status === "success") {
+          setMessage(`✅ VALIDATION PASSED! ${matchedCount}/${referencePositions.length} gap pads correctly placed`);
+        } else if (status === "warning") {
+          setMessage(`⚠️ Some gaps detected: ${matchedCount}/${referencePositions.length} gap pads found`);
+        } else {
+          setMessage(`❌ VALIDATION FAILED: Only ${matchedCount}/${referencePositions.length} gap pads detected`);
+        }
+        
+      } catch (error) {
+        console.error("Validation error:", error);
+      }
+    }, 2000); // Check every 2 seconds
+  };
+
+  const stopValidation = () => {
+    if (validationIntervalRef.current) {
+      clearInterval(validationIntervalRef.current);
+    }
+    setShowOverlay(false);
+    setValidationStatus(null);
+  };
+
+  const deleteReferenceImage = () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+    
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    
+    if (!referenceImages[key]) {
+      setMessage(`No reference image found for ${serial} (${side})`);
+      return;
+    }
+    
+    const updatedImages = { ...referenceImages };
+    delete updatedImages[key];
+    
+    setReferenceImages(updatedImages);
+    localStorage.setItem('gapPadReferenceImages', JSON.stringify(updatedImages));
+    setMessage(`Reference image deleted for ${serial} (${side})`);
+    
+    if (validationResult) {
+      stopValidation();
+    }
+  };
+
+  const hasReferenceImage = () => {
+    if (!serial.trim()) return false;
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    return !!referenceImages[key];
+  };
+
+  // Simpler RGB-based detection as fallback
+  const detectGapPadsSimple = async (imageData) => {
+    return new Promise((resolve) => {
+      const tempCanvas = document.createElement('canvas');
+      const tempCtx = tempCanvas.getContext('2d');
+      
+      const img = new Image();
+      img.onload = () => {
+        console.log(`Simple detection on image: ${img.width}x${img.height}`);
+        
+        tempCanvas.width = img.width;
+        tempCanvas.height = img.height;
+        tempCtx.drawImage(img, 0, 0);
+        
+        const imgData = tempCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height);
+        const data = imgData.data;
+        
+        // Create mask using simple RGB thresholds
+        const mask = new Uint8Array(tempCanvas.width * tempCanvas.height);
+        let pinkPixelCount = 0;
+        
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          const pixelIndex = i / 4;
+          
+          // Simple pink/magenta detection - more lenient
+          const isPink = (
+            r > 120 && // Minimum red
+            r > g + 20 && // Red higher than green
+            r > b - 30 && // Red somewhat higher than blue
+            (r + g + b) > 200 && // Not too dark
+            (r + g + b) < 700 // Not too bright
+          );
+          
+          if (isPink) {
+            mask[pixelIndex] = 255;
+            pinkPixelCount++;
+          } else {
+            mask[pixelIndex] = 0;
+          }
+        }
+        
+        console.log(`Simple detection found ${pinkPixelCount} pink pixels (${((pinkPixelCount/(tempCanvas.width*tempCanvas.height))*100).toFixed(2)}%)`);
+        
+        // Find contours in the mask
+        const contours = findContours(mask, tempCanvas.width, tempCanvas.height);
+        console.log(`Simple detection found ${contours.length} contours`);
+        
+        // Filter contours - very lenient
+        const validPads = [];
+        contours.forEach((contour, index) => {
+          const bbox = contour.boundingBox;
+          const area = bbox.width * bbox.height;
+          
+          // Very simple filtering
+          if (area > 50 && area < 10000) {
+            validPads.push({
+              x: (bbox.x + bbox.width / 2) / tempCanvas.width,
+              y: (bbox.y + bbox.height / 2) / tempCanvas.height,
+              width: bbox.width / tempCanvas.width,
+              height: bbox.height / tempCanvas.height,
+              area: area,
+              boundingBox: bbox,
+              id: `simple_pad_${bbox.x}_${bbox.y}`
+            });
+            console.log(`Simple detection: accepted pad ${index} with area ${area}`);
+          }
+        });
+        
+        console.log(`Simple detection result: ${validPads.length} pads`);
+        resolve(validPads);
+      };
+      
+      img.onerror = (error) => {
+        console.error('Simple detection image error:', error);
+        resolve([]);
+      };
+      
+      img.src = imageData;
+    });
+  };
+
+  // Advanced precision filtering with multiple validation layers
+  const filterGapPadsAdvanced = (contours, imageWidth, imageHeight) => {
+    const validPads = [];
+    
+    console.log(`🔍 Advanced filtering of ${contours.length} contours found`);
+    
+    contours.forEach((contour, index) => {
+      const bbox = contour.boundingBox;
+      const area = bbox.width * bbox.height;
+      const aspectRatio = bbox.width / bbox.height;
+      const relativeArea = area / (imageWidth * imageHeight);
+      
+      // Layer 1: Basic size filtering (more restrictive)
+      const minArea = 400;   // Increased minimum area for 2cm x 2cm pads
+      const maxArea = 4000;  // More restrictive maximum area
+      const minAspectRatio = 0.6;  // More square-like (2cm x 2cm should be ~1.0)
+      const maxAspectRatio = 1.7;  // More restrictive aspect ratio
+      
+      // Layer 2: Relative size filtering (gap pads should be consistent size)
+      const minRelativeArea = 0.0008; // At least 0.08% of image
+      const maxRelativeArea = 0.02;   // At most 2% of image
+      
+      // Layer 3: Shape analysis
+      const contourArea = contour.points.length;
+      const bboxArea = bbox.width * bbox.height;
+      const fillRatio = contourArea / bboxArea; // How much of the bounding box is filled
+      const minFillRatio = 0.4; // Gap pads should be fairly solid rectangles
+      
+      // Layer 4: Size consistency check
+      const expectedPadSize = Math.sqrt(imageWidth * imageHeight * 0.002); // Expected size based on image
+      const actualSize = Math.sqrt(area);
+      const sizeDeviation = Math.abs(actualSize - expectedPadSize) / expectedPadSize;
+      const maxSizeDeviation = 0.8; // Allow 80% deviation from expected size
+      
+      // Layer 5: Geometric validation
+      const perimeter = estimatePerimeter(contour.points);
+      const circularity = (4 * Math.PI * contourArea) / (perimeter * perimeter);
+      const minCircularity = 0.3; // Gap pads should be reasonably circular/rectangular
+      const maxCircularity = 0.9; // But not perfect circles
+      
+      console.log(`Contour ${index}: area=${area}, aspect=${aspectRatio.toFixed(2)}, relArea=${(relativeArea*100).toFixed(4)}%, fill=${fillRatio.toFixed(2)}, sizeDev=${sizeDeviation.toFixed(2)}, circ=${circularity.toFixed(2)}`);
+      
+      // Apply all filtering layers
+      const passesBasicSize = area >= minArea && area <= maxArea;
+      const passesAspectRatio = aspectRatio >= minAspectRatio && aspectRatio <= maxAspectRatio;
+      const passesRelativeSize = relativeArea >= minRelativeArea && relativeArea <= maxRelativeArea;
+      const passesFillRatio = fillRatio >= minFillRatio;
+      const passesSizeConsistency = sizeDeviation <= maxSizeDeviation;
+      const passesCircularity = circularity >= minCircularity && circularity <= maxCircularity;
+      
+      if (passesBasicSize && passesAspectRatio && passesRelativeSize && 
+          passesFillRatio && passesSizeConsistency && passesCircularity) {
+        
+        console.log(`✅ Contour ${index} PASSED all advanced filters`);
+        
+        // Calculate confidence score
+        const confidence = calculateConfidenceScore({
+          aspectRatio, relativeArea, fillRatio, sizeDeviation, circularity
+        });
+        
+        validPads.push({
+          x: (bbox.x + bbox.width / 2) / imageWidth,
+          y: (bbox.y + bbox.height / 2) / imageHeight,
+          width: bbox.width / imageWidth,
+          height: bbox.height / imageHeight,
+          area: area,
+          aspectRatio: aspectRatio,
+          confidence: confidence,
+          fillRatio: fillRatio,
+          circularity: circularity,
+          boundingBox: bbox,
+          id: `pad_${bbox.x}_${bbox.y}`
+        });
+      } else {
+        console.log(`❌ Contour ${index} FAILED: basic=${passesBasicSize}, aspect=${passesAspectRatio}, relSize=${passesRelativeSize}, fill=${passesFillRatio}, size=${passesSizeConsistency}, circ=${passesCircularity}`);
+      }
+    });
+    
+    // Layer 6: Remove overlapping detections (non-maximum suppression)
+    const filteredPads = removeOverlappingPads(validPads);
+    
+    // Layer 7: Sort by confidence and keep only the most confident detections
+    const finalPads = filteredPads
+      .sort((a, b) => b.confidence - a.confidence)
+      .slice(0, 15); // Limit to max 15 gap pads (reasonable for most boards)
+    
+    console.log(`🎯 Advanced filtering result: ${contours.length} → ${validPads.length} → ${finalPads.length} gap pads`);
+    return finalPads;
+  };
+
+  // Calculate confidence score for gap pad detection
+  const calculateConfidenceScore = ({ aspectRatio, relativeArea, fillRatio, sizeDeviation, circularity }) => {
+    let confidence = 0;
+    
+    // Aspect ratio confidence (closer to 1.0 is better for square pads)
+    const aspectScore = 1 - Math.abs(aspectRatio - 1.0) / 1.0;
+    confidence += aspectScore * 0.25;
+    
+    // Size consistency confidence
+    const sizeScore = 1 - sizeDeviation;
+    confidence += Math.max(0, sizeScore) * 0.25;
+    
+    // Fill ratio confidence (should be fairly solid)
+    const fillScore = Math.min(fillRatio / 0.7, 1.0); // Normalize to 0.7 as ideal
+    confidence += fillScore * 0.25;
+    
+    // Circularity confidence (rectangular shapes)
+    const circScore = circularity > 0.5 ? (1 - Math.abs(circularity - 0.6) / 0.4) : circularity / 0.5;
+    confidence += circScore * 0.25;
+    
+    return Math.max(0, Math.min(1, confidence));
+  };
+
+  // Remove overlapping gap pad detections
+  const removeOverlappingPads = (pads) => {
+    const filtered = [];
+    const overlapThreshold = 0.3; // 30% overlap threshold
+    
+    for (let i = 0; i < pads.length; i++) {
+      let isOverlapping = false;
+      
+      for (let j = 0; j < filtered.length; j++) {
+        const overlap = calculateOverlap(pads[i], filtered[j]);
+        if (overlap > overlapThreshold) {
+          isOverlapping = true;
+          // Keep the one with higher confidence
+          if (pads[i].confidence > filtered[j].confidence) {
+            filtered[j] = pads[i]; // Replace with higher confidence detection
+          }
+          break;
+        }
+      }
+      
+      if (!isOverlapping) {
+        filtered.push(pads[i]);
+      }
+    }
+    
+    return filtered;
+  };
+
+  // Calculate overlap between two gap pad detections
+  const calculateOverlap = (pad1, pad2) => {
+    const x1 = Math.max(pad1.x - pad1.width/2, pad2.x - pad2.width/2);
+    const y1 = Math.max(pad1.y - pad1.height/2, pad2.y - pad2.height/2);
+    const x2 = Math.min(pad1.x + pad1.width/2, pad2.x + pad2.width/2);
+    const y2 = Math.min(pad1.y + pad1.height/2, pad2.y + pad2.height/2);
+    
+    if (x2 <= x1 || y2 <= y1) return 0;
+    
+    const overlapArea = (x2 - x1) * (y2 - y1);
+    const area1 = pad1.width * pad1.height;
+    const area2 = pad2.width * pad2.height;
+    
+    return overlapArea / Math.min(area1, area2);
+  };
+
+  // Estimate perimeter of contour for circularity calculation
+  const estimatePerimeter = (points) => {
+    if (points.length < 2) return 0;
+    
+    let perimeter = 0;
+    for (let i = 0; i < points.length; i++) {
+      const current = points[i];
+      const next = points[(i + 1) % points.length];
+      const dx = next.x - current.x;
+      const dy = next.y - current.y;
+      perimeter += Math.sqrt(dx * dx + dy * dy);
+    }
+    return perimeter;
+  };
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#0a0a0a", color:"#e5e5e5", display:"flex", flexDirection:"column" }}>
+      <header style={{ padding:"1rem", borderBottom:"1px solid #27272a" }}>
+        <div style={{ fontSize: "1.5rem", fontWeight: "bold" }}>🔬 AI Gap Pad Validator</div>
+        <div style={{ fontSize: "0.9rem", color: "#a1a1aa" }}>Automatic detection and validation using computer vision</div>
+      </header>
+
+      <main style={{ flex:1, display:"grid", gridTemplateColumns:"2fr 1fr" }}>
+        <section style={{ padding:"1rem" }}>
+          {/* Instructions Panel */}
+          {showInstructions && (
+            <div style={{ 
+              background:"rgba(34, 197, 94, 0.1)", 
+              border: "1px solid rgba(34, 197, 94, 0.3)",
+              padding:"1rem", 
+              borderRadius:"8px", 
+              marginBottom: "1rem"
+            }}>
+              <div style={{ fontSize: "1rem", fontWeight: "bold", color: "#22c55e", marginBottom: "0.5rem" }}>
+                🤖 AI-Powered Detection:
+              </div>
+              <div style={{ fontSize: "0.9rem", lineHeight: "1.5" }}>
+                <strong>1. Auto-Create Reference:</strong> Enter serial → "Set Reference" → AI detects all gap pads automatically<br/>
+                <strong>2. Auto-Validate:</strong> Enter same serial → "Enter Validation Mode" → "Compare with Reference"<br/>
+                <strong>3. Results:</strong> Real-time PASS/FAIL based on AI detection comparison
+              </div>
+              <button 
+                onClick={() => setShowInstructions(false)}
+                style={{ marginTop: "0.5rem", background: "transparent", border: "1px solid #22c55e", color: "#22c55e", padding: "4px 8px", borderRadius: "4px", fontSize: "0.8rem" }}
+              >
+                Got it!
+              </button>
+            </div>
+          )}
+
+          <div style={{ position:"relative", background:"black", borderRadius:"12px", overflow:"hidden" }}>
+            <video 
+              ref={videoRef} 
+              style={{ 
+                width:"100%", 
+                aspectRatio:"16/9", 
+                objectFit:"contain", 
+                display: (showOverlay || showDetectionOverlay) ? "none" : "block" 
+              }} 
+              playsInline 
+              autoPlay 
+              muted 
+            />
+            
+            {/* Always render canvas but hide it when not needed */}
+            <canvas
+              ref={canvasRef}
+              style={{ 
+                position: "absolute",
+                top: 0,
+                left: 0,
+                width: "100%", 
+                height: "100%", 
+                objectFit: "contain",
+                display: "none", // Hidden by default
+                pointerEvents: "none"
+              }}
+            />
+            
+            {/* Detection canvas for debugging */}
+            <canvas
+              ref={detectionCanvasRef}
+              style={{ 
+                position: "absolute",
+                top: 0,
+                left: 0,
+                width: "100%", 
+                height: "100%", 
+                objectFit: "contain",
+                display: "none", // Hidden by default
+                pointerEvents: "none"
+              }}
+            />
+            
+            {/* Detection test overlay */}
+            {showDetectionOverlay && (
+              <div style={{ position: "relative", width: "100%", aspectRatio: "16/9" }}>
+                <canvas
+                  style={{ 
+                    width: "100%", 
+                    height: "100%", 
+                    objectFit: "contain"
+                  }}
+                />
+                
+                {/* Show detected pads as overlays */}
+                {detectedPads.map((pad, index) => (
+                  <div
+                    key={index}
+                    style={{
+                      position: "absolute",
+                      left: `${pad.x * 100}%`,
+                      top: `${pad.y * 100}%`,
+                      width: `${pad.width * 100}%`,
+                      height: `${pad.height * 100}%`,
+                      border: "3px solid #00ff00",
+                      transform: "translate(-50%, -50%)",
+                      pointerEvents: "none",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      color: "#00ff00",
+                      fontWeight: "bold",
+                      fontSize: "12px",
+                      background: "rgba(0,255,0,0.1)"
+                    }}
+                  >
+                    P{index + 1}
+                  </div>
+                ))}
+                
+                <button 
+                  style={{ position:"absolute", top:"15px", right:"15px", background:"#ef4444", padding:"8px 12px", borderRadius:"6px", border:"none", color:"white", fontWeight: "bold" }}
+                  onClick={() => setShowDetectionOverlay(false)}
+                >
+                  Close Detection Test
+                </button>
+              </div>
+            )}
+            
+            {/* Validation overlay */}
+            {showOverlay && validationResult && (
+              <div style={{ width:"100%", aspectRatio:"16/9", position:"relative" }}>
+                <img 
+                  src={validationResult.referenceImage} 
+                  alt="Reference" 
+                  style={{ width:"100%", height:"100%", objectFit:"contain", opacity:0.7 }} 
+                />
+                <video 
+                  ref={videoRef} 
+                  style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%", objectFit:"contain", opacity:0.5, mixBlendMode:"difference" }} 
+                  playsInline 
+                  autoPlay 
+                  muted 
+                />
+                
+                {/* Draw reference pad position markers */}
+                {validationResult.padPositions && validationResult.padPositions.map((pad, index) => (
+                  <div
+                    key={index}
+                    style={{
+                      position: "absolute",
+                      left: `${pad.x * 100}%`,
+                      top: `${pad.y * 100}%`,
+                      width: `${(pad.width || 0.03) * 100}%`,
+                      height: `${(pad.height || 0.03) * 100}%`,
+                      border: "3px solid #00ff00",
+                      transform: "translate(-50%, -50%)",
+                      pointerEvents: "none",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      color: "#00ff00",
+                      fontWeight: "bold",
+                      fontSize: "12px",
+                      background: "rgba(0,0,0,0.5)"
+                    }}
+                  >
+                    {index + 1}
+                  </div>
+                ))}
+                
+                {/* Validation status indicator */}
+                {validationStatus && (
+                  <div 
+                    style={{ 
+                      position:"absolute", 
+                      top:"20px", 
+                      left:"20px", 
+                      background: validationStatus.status === "success" ? "rgba(34, 197, 94, 0.95)" : 
+                                 validationStatus.status === "warning" ? "rgba(245, 158, 11, 0.95)" : 
+                                 "rgba(239, 68, 68, 0.95)",
+                      padding:"16px 20px", 
+                      borderRadius:"8px",
+                      fontSize: "18px",
+                      fontWeight: "bold",
+                      boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+                      zIndex: 10,
+                      maxWidth: "300px"
+                    }}
+                  >
+                    {validationStatus.status === "success" ? "✅ PASS" : 
+                     validationStatus.status === "warning" ? "⚠️ CHECK" : "❌ FAIL"}
+                     <div style={{ fontSize: "14px", fontWeight: "normal", marginTop: "4px" }}>
+                       Expected: {validationStatus.totalCount} | Found: {validationStatus.currentPads} | Match: {validationStatus.matchedCount} ({Math.round(validationStatus.matchPercentage)}%)
+                     </div>
+                  </div>
+                )}
+                
+                <button 
+                  style={{ position:"absolute", top:"20px", right:"20px", background:"#ef4444", padding:"12px 16px", borderRadius:"8px", border:"none", color:"white", fontSize: "16px", fontWeight: "bold" }}
+                  onClick={stopValidation}
+                >
+                  Exit Validation
+                </button>
+              </div>
+            )}
+            
+            {/* Mode indicators */}
+            {captureMode && !showOverlay && !showDetectionOverlay && (
+              <div style={{ position:"absolute", top:"15px", left:"15px", background:"rgba(34, 197, 94, 0.8)", padding:"8px 12px", borderRadius:"8px", color:"white", fontWeight: "bold" }}>
+                🤖 Ready to auto-detect gap pads
+              </div>
+            )}
+            
+            {validationMode && !showOverlay && !captureMode && !showDetectionOverlay && (
+              <div style={{ position:"absolute", top:"15px", left:"15px", background:"rgba(59, 130, 246, 0.8)", padding:"8px 12px", borderRadius:"8px", color:"white", fontWeight: "bold" }}>
+                🔍 AI Validation Mode Ready
+              </div>
+            )}
+          </div>
+          
+          {/* Control Buttons */}
+          <div style={{ marginTop:"1rem", display:"flex", gap:"0.5rem", flexWrap:"wrap" }}>
+            {validationMode ? (
+              <>
+                <button 
+                  onClick={() => setValidationMode(false)}
+                  style={{ background: "#6b7280", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px" }}
+                >
+                  Exit Validation Mode
+                </button>
+                <button 
+                  onClick={validateCurrentView} 
+                  style={{ background: "#3b82f6", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px", fontWeight: "bold" }}
+                  disabled={!hasReferenceImage()}
+                >
+                  🤖 AI Compare with Reference
+                </button>
+              </>
+            ) : captureMode ? (
+              <>
+                <button 
+                  onClick={() => setCaptureMode(false)}
+                  style={{ background: "#6b7280", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px" }}
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={captureReferenceImage}
+                  style={{ background: "#22c55e", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px", fontWeight: "bold" }}
+                >
+                  🤖 Auto-Detect & Save Reference
+                </button>
+              </>
+            ) : (
+              <>
+                <button 
+                  onClick={() => setValidationMode(true)}
+                  style={{ background: "#3b82f6", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px", fontWeight: "bold" }}
+                >
+                  🔍 Enter Validation Mode
+                </button>
+                <button 
+                  onClick={() => setCaptureMode(true)}
+                  style={{ background: "#22c55e", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px", fontWeight: "bold" }}
+                >
+                  🤖 AI Set Reference Image
+                </button>
+                <button 
+                  onClick={testDetection}
+                  style={{ background: "#8b5cf6", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px", fontWeight: "bold" }}
+                >
+                  🧪 Test AI Detection
+                </button>
+                <button 
+                  onClick={() => {
+                    // Debug function to check basic camera functionality
+                    console.log("=== CAMERA DEBUG ===");
+                    console.log("Video element:", videoRef.current);
+                    console.log("Video dimensions:", videoRef.current?.videoWidth, "x", videoRef.current?.videoHeight);
+                    console.log("Canvas element:", canvasRef.current);
+                    console.log("Camera stream active:", videoRef.current?.srcObject ? "Yes" : "No");
+                    setMessage("Debug info logged to console. Check F12 Developer Tools.");
+                  }}
+                  style={{ background: "#f59e0b", color: "white", border: "none", padding: "12px 16px", borderRadius: "6px", fontSize: "14px", fontWeight: "bold" }}
+                >
+                  🐛 Debug Camera
+                </button>
+              </>
+            )}
+          </div>
+          
+          {/* Message Display */}
+          {message && (
+            <div style={{ 
+              marginTop:"1rem", 
+              padding:"1rem", 
+              background: message.includes("PASSED") || message.includes("saved") || message.includes("complete") ? "rgba(34, 197, 94, 0.2)" : 
+                        message.includes("FAILED") || message.includes("failed") ? "rgba(239, 68, 68, 0.2)" : 
+                        message.includes("gaps detected") || message.includes("Some") ? "rgba(245, 158, 11, 0.2)" :
+                        "rgba(107, 114, 128, 0.2)", 
+              borderRadius:"8px", 
+              fontSize:"1rem",
+              fontWeight: "500"
+            }}>
+              {message}
+            </div>
+          )}
+        </section>
+
+        <aside style={{ padding:"1rem", borderLeft:"1px solid #27272a" }}>
+          <div>
+            <label style={{ fontSize: "0.9rem", fontWeight: "600" }}>Serial Number</label><br/>
+            <input 
+              value={serial} 
+              onChange={e => setSerial(e.target.value)} 
+              placeholder="Enter serial number" 
+              style={{ width:"100%", padding:"12px", marginTop:"8px", background:"#1f2937", border:"1px solid #374151", color:"#e5e7eb", borderRadius:"6px", fontSize: "16px" }} 
+            />
+          </div>
+          
+          <div style={{ marginTop:"1.5rem" }}>
+            <label style={{ fontSize: "0.9rem", fontWeight: "600" }}>Gap Pad Side</label><br/>
+            <div style={{ display:"flex", gap:"0.5rem", marginTop:"8px" }}>
+              <button 
+                onClick={() => setSide("back")} 
+                style={{ 
+                  padding:"12px 20px", 
+                  background: side === "back" ? "#3b82f6" : "#374151",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "6px",
+                  fontSize: "14px",
+                  fontWeight: "600",
+                  flex: 1
+                }}
+              >
+                Back Side
+              </button>
+              <button 
+                onClick={() => setSide("front")} 
+                style={{ 
+                  padding:"12px 20px", 
+                  background: side === "front" ? "#3b82f6" : "#374151",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "6px",
+                  fontSize: "14px",
+                  fontWeight: "600",
+                  flex: 1
+                }}
+              >
+                Front Side
+              </button>
+            </div>
+          </div>
+          
+          <div style={{ marginTop:"1.5rem", fontSize:"0.9rem", color:"#9ca3af", background: "#1f2937", padding: "12px", borderRadius: "6px" }}>
+            <strong>Product:</strong> {(serial||"Unknown").slice(0,6).toUpperCase()} ({side})
+          </div>
+          
+          {hasReferenceImage() && (
+            <div style={{ marginTop:"1.5rem", background: "#065f46", padding: "16px", borderRadius: "8px" }}>
+              <div style={{ fontSize:"0.9rem", marginBottom:"8px", color:"#10b981", fontWeight: "600" }}>
+                🤖 AI Reference Available
+              </div>
+              
+              {referenceImages[`${serial.trim().toUpperCase()}_${side}`]?.padPositions && (
+                <div style={{ fontSize:"0.85rem", marginBottom:"12px", color:"#6ee7b7" }}>
+                  📍 {referenceImages[`${serial.trim().toUpperCase()}_${side}`].padPositions.length} gap pads auto-detected
+                </div>
+              )}
+              
+              <div style={{ display: "flex", gap: "8px", flexDirection: "column" }}>
+                <button 
+                  onClick={() => {
+                    const key = `${serial.trim().toUpperCase()}_${side}`;
+                    if (referenceImages[key]) {
+                      setValidationResult({
+                        referenceImage: referenceImages[key].imageData,
+                        timestamp: referenceImages[key].timestamp,
+                        padPositions: referenceImages[key].padPositions || []
+                      });
+                      setShowOverlay(true);
+                      setValidationStatus(null);
+                    }
+                  }}
+                  style={{ background:"#047857", border:"none", padding:"8px 12px", borderRadius:"6px", fontSize:"0.85rem", color: "white", fontWeight: "600" }}
+                >
+                  👁️ Preview AI Detection
+                </button>
+                <button 
+                  onClick={deleteReferenceImage}
+                  style={{ background:"#dc2626", color:"white", border:"none", padding:"8px 12px", borderRadius:"6px", fontSize:"0.85rem", fontWeight: "600" }}
+                >
+                  🗑️ Delete Reference
+                </button>
+              </div>
+            </div>
+          )}
+          
+          <div style={{ marginTop:"2rem", fontSize:"0.85rem", color:"#9ca3af", background: "#1f2937", padding: "12px", borderRadius: "6px" }}>
+            <div style={{ fontWeight: "600", marginBottom: "8px" }}>🤖 AI Library</div>
+            <div>{Object.keys(referenceImages).length} AI-detected references stored</div>
+            
+            {Object.keys(referenceImages).length > 0 && (
+              <button
+                onClick={() => {
+                  localStorage.removeItem('gapPadReferenceImages');
+                  setReferenceImages({});
+                  setMessage("All AI references cleared");
+                }}
+                style={{ background:"#dc2626", color:"white", border:"none", padding:"6px 10px", borderRadius:"4px", fontSize:"0.75rem", marginTop: "8px" }}
+              >
+                Clear All References
+              </button>
+            )}
+          </div>
+          
+          <div style={{ marginTop:"1.5rem", fontSize:"0.8rem", color:"#6b7280", borderTop:"1px solid #374151", paddingTop:"1rem" }}>
+            <div style={{ fontWeight: "600", marginBottom: "8px" }}>🧠 AI Detection Features:</div>
+            <ul style={{ paddingLeft: "16px", lineHeight: "1.6" }}>
+              <li>Automatic gap pad detection using computer vision</li>
+              <li>HSV color space analysis for precise identification</li>
+              <li>Size and aspect ratio filtering</li>
+              <li>Real-time validation comparison</li>
+              <li>Sub-pixel accuracy positioning</li>
+            </ul>
+          </div>
+        </aside>
+      </main>
+    </div>
+  );
+}

@@ -1,0 +1,1136 @@
+﻿import React, { useRef, useState, useEffect } from "react";
+
+export default function App() {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const detectionCanvasRef = useRef(null);
+  const [serial, setSerial] = useState("");
+  const [side, setSide] = useState("back");
+  const [validationMode, setValidationMode] = useState(false);
+  const [referenceImages, setReferenceImages] = useState({});
+  const [captureMode, setCaptureMode] = useState(false);
+  const [validationResult, setValidationResult] = useState(null);
+  const [showOverlay, setShowOverlay] = useState(false);
+  const [message, setMessage] = useState("");
+  const [validationStatus, setValidationStatus] = useState(null);
+  const [padPositions, setPadPositions] = useState([]);
+  const [validationInProgress, setValidationInProgress] = useState(false);
+  const validationIntervalRef = useRef(null);
+  const [showColorTestCanvas, setShowColorTestCanvas] = useState(false);
+  const [colorSensitivity, setColorSensitivity] = useState(1); // Default sensitivity (1-5)
+  const [manualDetection, setManualDetection] = useState(false);
+  const [manualPositions, setManualPositions] = useState([]);
+
+  // Color detection parameters - significantly widened for better detection
+  const colorThreshold = {
+    // Pink/Magenta detection parameters - much broader range
+    hueMin: 240, // Expanded to include purplish-blues
+    hueMax: 360, // Up to red
+    satMin: 20,  // Lower saturation threshold
+    valMin: 30   // Lower value threshold
+  };
+
+  useEffect(() => {
+    // Load saved reference images from localStorage on component mount
+    const savedImages = localStorage.getItem('gapPadReferenceImages');
+    if (savedImages) {
+      try {
+        const parsed = JSON.parse(savedImages);
+        setReferenceImages(parsed);
+      } catch (e) {
+        console.error("Failed to parse saved images", e);
+        setMessage("Error loading saved images");
+      }
+    }
+    
+    // Load last used settings
+    const sensitivity = localStorage.getItem('colorSensitivity');
+    if (sensitivity) {
+      setColorSensitivity(Number(sensitivity));
+    }
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { 
+            facingMode: "environment",
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }, 
+          audio: false 
+        });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play();
+        }
+      } catch (err) {
+        console.error("Camera error", err);
+        setMessage("Camera access error. Please check permissions.");
+      }
+    })();
+
+    // Cleanup function for validation interval
+    return () => {
+      if (validationIntervalRef.current) {
+        clearInterval(validationIntervalRef.current);
+      }
+    };
+  }, []);
+
+  // Multi-method color detection approach with sensitivity adjustment
+  const isPinkOrMagenta = (r, g, b) => {
+    // Adjust detection sensitivity based on user setting
+    const sensitivity = colorSensitivity || 1;
+    const adjustedThreshold = {
+      redBoost: 5 + (sensitivity * 10), // Boost red component importance
+      greenLimit: 130 - (sensitivity * 10), // Reduce maximum allowed green
+      saturationMin: Math.max(10, colorThreshold.satMin - (sensitivity * 5)),
+      valueMin: Math.max(20, colorThreshold.valMin - (sensitivity * 5))
+    };
+    
+    // Method 1: HSV color space
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const delta = max - min;
+    
+    let hue;
+    if (delta === 0) {
+      hue = 0;
+    } else if (max === r) {
+      hue = ((g - b) / delta) % 6;
+    } else if (max === g) {
+      hue = (b - r) / delta + 2;
+    } else {
+      hue = (r - g) / delta + 4;
+    }
+    
+    hue = Math.round(hue * 60);
+    if (hue < 0) hue += 360;
+    
+    const saturation = max === 0 ? 0 : Math.round((delta / max) * 100);
+    const value = Math.round((max / 255) * 100);
+    
+    // Method 2: Direct RGB ratio checks - adjusted by sensitivity
+    const isPinkByRatio = (r > g + adjustedThreshold.redBoost) && 
+                          (r > b - 20) && 
+                          (r > 120) && 
+                          (g < adjustedThreshold.greenLimit);
+    
+    // Method 3: Specific shade ranges based on common thermal pad colors
+    const isPinkThermalPad = (
+      // Classic pink/magenta thermal pad - most common
+      (r > 120 && g < 110 && b > 60) || 
+      // Reddish thermal pad - common variant
+      (r > 140 && g < 120 && b < 120 && r > g + 30) || 
+      // Purple-ish thermal pad - less common variant
+      (r > 100 && g < 90 && b > 90 && r - g > 20)
+    );
+    
+    // Method 4: HSV-based detection with sensitivity adjustment
+    const isInHSVRange = (
+      (hue >= colorThreshold.hueMin && hue <= colorThreshold.hueMax) &&
+      (saturation >= adjustedThreshold.saturationMin) && 
+      (value >= adjustedThreshold.valueMin)
+    );
+    
+    // Method 5: Specifically targeting the pink shade in your screenshot
+    const isVisiblePink = (
+      r > 170 && g < 100 && b > 80 && 
+      r > g + 80 && // Red much higher than green
+      r > b * 0.8   // Red somewhat higher than blue
+    );
+    
+    // Combined decision weighted by sensitivity
+    if (sensitivity >= 4) {
+      // At highest sensitivity, be very lenient
+      return isPinkByRatio || isPinkThermalPad || isInHSVRange || isVisiblePink;
+    } else if (sensitivity >= 3) {
+      // High sensitivity - any method can trigger detection
+      return (isPinkByRatio || isPinkThermalPad || isInHSVRange || isVisiblePink);
+    } else if (sensitivity >= 2) {
+      // Medium sensitivity - specific methods or combinations
+      return isVisiblePink || isPinkThermalPad || (isPinkByRatio && (r > g + 50));
+    } else {
+      // Low sensitivity - require stronger evidence
+      return isVisiblePink || (isPinkThermalPad && r > g + 60);
+    }
+  };
+
+  // Detect gap pads in an image
+  const detectGapPads = (imageData, key) => {
+    return new Promise((resolve) => {
+      // If manual detection is on and we have manual positions, use those
+      if (manualDetection && manualPositions.length > 0) {
+        setPadPositions(manualPositions);
+        
+        // Update reference image if provided
+        if (key) {
+          const updatedImages = { ...referenceImages };
+          
+          if (updatedImages[key]) {
+            updatedImages[key] = {
+              ...updatedImages[key],
+              padPositions: manualPositions
+            };
+            
+            setReferenceImages(updatedImages);
+            localStorage.setItem('gapPadReferenceImages', JSON.stringify(updatedImages));
+          }
+        }
+        
+        resolve(manualPositions);
+        return;
+      }
+    
+      const tempCanvas = document.createElement('canvas');
+      const tempCtx = tempCanvas.getContext('2d');
+      
+      const img = new Image();
+      
+      img.onload = () => {
+        tempCanvas.width = img.width;
+        tempCanvas.height = img.height;
+        tempCtx.drawImage(img, 0, 0);
+        
+        const imgData = tempCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height);
+        const data = imgData.data;
+        
+        // Array to store detected gap pad positions
+        const positions = [];
+        
+        // Simplified detection algorithm - looks for clusters of pink/magenta pixels
+        const visited = new Set();
+        const clusterMinSize = 20 - (colorSensitivity * 3); // Adjust min size based on sensitivity
+        
+        // Create a detection heatmap for debugging
+        const heatmapCanvas = document.createElement('canvas');
+        const heatmapCtx = heatmapCanvas.getContext('2d');
+        heatmapCanvas.width = tempCanvas.width;
+        heatmapCanvas.height = tempCanvas.height;
+        heatmapCtx.drawImage(img, 0, 0);
+        const heatmapData = heatmapCtx.getImageData(0, 0, heatmapCanvas.width, heatmapCanvas.height);
+        const heatmap = heatmapData.data;
+        
+        // First pass: Detect all pink/magenta pixels for heatmap
+        let pinkPixelCount = 0;
+        for (let y = 0; y < tempCanvas.height; y += 2) { // Even more dense sampling
+          for (let x = 0; x < tempCanvas.width; x += 2) {
+            const index = (y * tempCanvas.width + x) * 4;
+            const r = data[index];
+            const g = data[index + 1];
+            const b = data[index + 2];
+            
+            // If this pixel is pink/magenta, mark it on heatmap
+            if (isPinkOrMagenta(r, g, b)) {
+              pinkPixelCount++;
+              const heatIndex = (y * tempCanvas.width + x) * 4;
+              heatmap[heatIndex] = 0; // R
+              heatmap[heatIndex + 1] = 255; // G
+              heatmap[heatIndex + 2] = 0; // B
+            }
+          }
+        }
+        
+        console.log(`Detected ${pinkPixelCount} pink pixels in image`);
+        
+        // Second pass: Detect clusters
+        for (let y = 0; y < tempCanvas.height; y += 2) {
+          for (let x = 0; x < tempCanvas.width; x += 2) {
+            const index = (y * tempCanvas.width + x) * 4;
+            const r = data[index];
+            const g = data[index + 1];
+            const b = data[index + 2];
+            
+            // If this pixel is pink/magenta and not already part of a cluster
+            if (isPinkOrMagenta(r, g, b) && !visited.has(`${x},${y}`)) {
+              // Use flood fill to find the cluster
+              const cluster = floodFill(data, tempCanvas.width, tempCanvas.height, x, y, visited);
+              
+              if (cluster.points.length >= clusterMinSize) {
+                // Calculate the center of the cluster
+                const centerX = cluster.sumX / cluster.points.length;
+                const centerY = cluster.sumY / cluster.points.length;
+                
+                positions.push({
+                  x: centerX / tempCanvas.width, // Store as ratio for resolution independence
+                  y: centerY / tempCanvas.height,
+                  size: cluster.points.length
+                });
+                
+                // Draw a circle on heatmap for detected cluster
+                heatmapCtx.beginPath();
+                heatmapCtx.arc(centerX, centerY, 15, 0, 2 * Math.PI);
+                heatmapCtx.strokeStyle = 'yellow';
+                heatmapCtx.lineWidth = 3;
+                heatmapCtx.stroke();
+              }
+            }
+          }
+        }
+        
+        // Save the heatmap for debugging
+        localStorage.setItem('detectionHeatmap', heatmapCanvas.toDataURL());
+        
+        setPadPositions(positions);
+        
+        // Draw detection results for visualization
+        if (detectionCanvasRef.current) {
+          const ctx = detectionCanvasRef.current.getContext('2d');
+          detectionCanvasRef.current.width = tempCanvas.width;
+          detectionCanvasRef.current.height = tempCanvas.height;
+          
+          // Draw original image
+          ctx.drawImage(img, 0, 0);
+          
+          // Draw detected gap pad positions
+          positions.forEach(pad => {
+            ctx.beginPath();
+            ctx.arc(
+              pad.x * tempCanvas.width, 
+              pad.y * tempCanvas.height, 
+              15, 0, 2 * Math.PI
+            );
+            ctx.strokeStyle = 'lime';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+          });
+          
+          // Save the detection result for debugging
+          localStorage.setItem('lastDetection', detectionCanvasRef.current.toDataURL());
+        }
+        
+        console.log(`Detected ${positions.length} gap pads`);
+        
+        // Update the reference image with the detected positions
+        if (key) {
+          const updatedImages = { ...referenceImages };
+          
+          if (updatedImages[key]) {
+            updatedImages[key] = {
+              ...updatedImages[key],
+              padPositions: positions
+            };
+            
+            setReferenceImages(updatedImages);
+            localStorage.setItem('gapPadReferenceImages', JSON.stringify(updatedImages));
+          }
+        }
+        
+        resolve(positions);
+      };
+      
+      img.src = imageData;
+    });
+  };
+
+  // Simple flood fill algorithm to find connected pink/magenta pixels
+  const floodFill = (imageData, width, height, startX, startY, visited) => {
+    const queue = [{x: startX, y: startY}];
+    const result = {points: [], sumX: 0, sumY: 0};
+    let queueSize = 0; // Safety counter to prevent infinite loops
+    
+    while (queue.length > 0 && queueSize < 10000) { // Limit to prevent browser freezing
+      queueSize++;
+      const {x, y} = queue.shift();
+      const key = `${x},${y}`;
+      
+      // Skip if already visited or out of bounds
+      if (visited.has(key) || x < 0 || y < 0 || x >= width || y >= height) {
+        continue;
+      }
+      
+      // Check if pixel is pink/magenta
+      const index = (y * width + x) * 4;
+      const r = imageData[index];
+      const g = imageData[index + 1];
+      const b = imageData[index + 2];
+      
+      if (!isPinkOrMagenta(r, g, b)) {
+        continue;
+      }
+      
+      // Mark as visited
+      visited.add(key);
+      result.points.push({x, y});
+      result.sumX += x;
+      result.sumY += y;
+      
+      // Add neighbors to queue (8-connected neighborhood for better detection)
+      queue.push({x: x+2, y: y});
+      queue.push({x: x-2, y: y});
+      queue.push({x: x, y: y+2});
+      queue.push({x: x, y: y-2});
+      queue.push({x: x+2, y: y+2}); // Diagonals for better connectivity
+      queue.push({x: x+2, y: y-2});
+      queue.push({x: x-2, y: y+2});
+      queue.push({x: x-2, y: y-2});
+    }
+    
+    return result;
+  };
+
+  // Add a gap pad marker manually
+  const addManualPadMarker = (event) => {
+    if (!manualDetection || !canvasRef.current) return;
+    
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    
+    // Calculate the position in the canvas coordinates
+    const x = (event.clientX - rect.left) * scaleX;
+    const y = (event.clientY - rect.top) * scaleY;
+    
+    // Add the position as ratio (for resolution independence)
+    const newPos = {
+      x: x / canvas.width,
+      y: y / canvas.height,
+      size: 100 // Default size
+    };
+    
+    // Add to manual positions
+    setManualPositions([...manualPositions, newPos]);
+    
+    // Draw on the canvas
+    const ctx = canvas.getContext('2d');
+    ctx.beginPath();
+    ctx.arc(x, y, 15, 0, 2 * Math.PI);
+    ctx.strokeStyle = 'lime';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    
+    setMessage(`Added manual marker at position ${Math.round(x)},${Math.round(y)}`);
+  };
+
+  const captureReferenceImage = async () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    
+    if (!video || !canvas) return;
+    
+    const context = canvas.getContext('2d');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+    const imageData = canvas.toDataURL('image/jpeg');
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    
+    // Detect gap pad positions
+    setMessage("Analyzing gap pad positions...");
+    
+    // Save the reference image first
+    const updatedImages = {
+      ...referenceImages,
+      [key]: {
+        imageData,
+        timestamp: new Date().toISOString(),
+        serial: serial.trim().toUpperCase(),
+        side,
+        padPositions: [] // Will be updated after detection
+      }
+    };
+    
+    setReferenceImages(updatedImages);
+    localStorage.setItem('gapPadReferenceImages', JSON.stringify(updatedImages));
+    
+    try {
+      // Now detect pad positions and update the saved reference
+      const positions = await detectGapPads(imageData, key);
+      
+      if (positions.length > 0) {
+        setMessage(`Reference saved with ${positions.length} gap pads detected`);
+      } else {
+        setMessage("Warning: No gap pads detected. Try adjusting sensitivity or using manual mode.");
+      }
+    } catch (err) {
+      console.error("Error detecting pads:", err);
+      setMessage("Reference image saved, but pad detection failed");
+    }
+    
+    setCaptureMode(false);
+  };
+
+  const validateCurrentView = async () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+    
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    
+    if (!referenceImages[key]) {
+      setMessage(`No reference image found for ${serial} (${side})`);
+      return;
+    }
+    
+    const refImage = referenceImages[key];
+    
+    // Make sure we have pad positions
+    let positions = refImage.padPositions || [];
+    if (!positions || positions.length === 0) {
+      setMessage("Detecting pad positions in reference image...");
+      try {
+        positions = await detectGapPads(refImage.imageData, key);
+        if (positions.length === 0) {
+          setMessage("Could not detect any gap pads in reference. Try recapturing with higher sensitivity.");
+          return;
+        }
+      } catch (err) {
+        console.error("Error detecting pads in reference:", err);
+        setMessage("Error analyzing reference image. Try recapturing.");
+        return;
+      }
+    }
+    
+    setValidationResult({
+      referenceImage: refImage.imageData,
+      timestamp: refImage.timestamp,
+      padPositions: positions
+    });
+    
+    setShowOverlay(true);
+    setMessage("Analyzing gap pad placement...");
+    setValidationInProgress(true);
+    
+    // Start continuous validation
+    if (validationIntervalRef.current) {
+      clearInterval(validationIntervalRef.current);
+    }
+    
+    validationIntervalRef.current = setInterval(() => {
+      if (!videoRef.current || !canvasRef.current || !showOverlay) {
+        return;
+      }
+      
+      // Capture current frame
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      const context = canvas.getContext('2d');
+      
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      
+      // Get frame data for analysis
+      const frameData = context.getImageData(0, 0, canvas.width, canvas.height);
+      const data = frameData.data;
+      
+      // Check reference positions for gap pads
+      const referencePositions = refImage.padPositions || [];
+      let matchedCount = 0;
+      const tolerance = 0.15; // 15% tolerance for position matching (increased)
+      
+      if (referencePositions.length === 0) {
+        setValidationStatus({
+          status: "warning",
+          matchPercentage: 0,
+          matchedCount: 0,
+          totalCount: 0
+        });
+        setMessage("No reference pad positions available. Please recapture reference.");
+        return;
+      }
+      
+      // For each reference position, check if there's a gap pad in the current frame
+      referencePositions.forEach(refPad => {
+        // Calculate pixel coordinates based on ratio
+        const checkX = Math.floor(refPad.x * canvas.width);
+        const checkY = Math.floor(refPad.y * canvas.height);
+        
+        // Check a larger area around the expected position
+        const areaSize = Math.max(30, Math.floor(Math.sqrt(refPad.size || 100) / 2));
+        let foundPink = false;
+        
+        for (let dy = -areaSize; dy <= areaSize; dy += 3) {
+          for (let dx = -areaSize; dx <= areaSize; dx += 3) {
+            const x = checkX + dx;
+            const y = checkY + dy;
+            
+            if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) {
+              continue;
+            }
+            
+            const index = (y * canvas.width + x) * 4;
+            const r = data[index];
+            const g = data[index + 1];
+            const b = data[index + 2];
+            
+            if (isPinkOrMagenta(r, g, b)) {
+              foundPink = true;
+              break;
+            }
+          }
+          if (foundPink) break;
+        }
+        
+        if (foundPink) {
+          matchedCount++;
+        }
+      });
+      
+      // Calculate match percentage
+      const matchPercentage = referencePositions.length > 0 
+        ? (matchedCount / referencePositions.length) * 100 
+        : 0;
+      
+      console.log(`Validation: ${matchedCount}/${referencePositions.length} pads matched (${matchPercentage.toFixed(2)}%)`);
+      
+      // Update validation status
+      let status;
+      if (matchPercentage >= 70) { // Further lowered threshold for success
+        status = "success";
+      } else if (matchPercentage >= 50) { // Further lowered threshold for warning
+        status = "warning";
+      } else {
+        status = "error";
+      }
+      
+      setValidationStatus({
+        status,
+        matchPercentage,
+        matchedCount,
+        totalCount: referencePositions.length
+      });
+      
+      // Update message
+      if (status === "success") {
+        setMessage(`Validation successful! ${matchedCount}/${referencePositions.length} gap pads detected.`);
+      } else if (status === "warning") {
+        setMessage(`Some gap pads may be misaligned (${matchedCount}/${referencePositions.length} detected).`);
+      } else {
+        setMessage(`Gap pad alignment incorrect (${matchedCount}/${referencePositions.length} detected).`);
+      }
+    }, 500); // Check every 500ms
+  };
+
+  const stopValidation = () => {
+    if (validationIntervalRef.current) {
+      clearInterval(validationIntervalRef.current);
+    }
+    setShowOverlay(false);
+    setValidationInProgress(false);
+    setValidationStatus(null);
+    setShowColorTestCanvas(false);
+  };
+
+  const deleteReferenceImage = () => {
+    if (!serial.trim()) {
+      setMessage("Please enter a serial number first");
+      return;
+    }
+    
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    
+    if (!referenceImages[key]) {
+      setMessage(`No reference image found for ${serial} (${side})`);
+      return;
+    }
+    
+    const updatedImages = { ...referenceImages };
+    delete updatedImages[key];
+    
+    setReferenceImages(updatedImages);
+    localStorage.setItem('gapPadReferenceImages', JSON.stringify(updatedImages));
+    setMessage(`Reference image deleted for ${serial} (${side})`);
+    
+    if (validationResult) {
+      stopValidation();
+    }
+  };
+
+  const hasReferenceImage = () => {
+    if (!serial.trim()) return false;
+    const key = `${serial.trim().toUpperCase()}_${side}`;
+    return !!referenceImages[key];
+  };
+
+  // Debug function to display color detection info
+  const testColorDetection = () => {
+    if (!canvasRef.current || !videoRef.current) return;
+    
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const video = videoRef.current;
+    
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imageData.data;
+    
+    // Apply pink/magenta detection
+    let detectedCount = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      const a = data[i + 3];
+      
+      // Skip transparent or very dark pixels
+      if (a < 255 || (r < 50 && g < 50 && b < 50)) {
+        continue;
+      }
+      
+      if (isPinkOrMagenta(r, g, b)) {
+        // Highlight detected pixels with bright green
+        data[i] = 0; // R
+        data[i + 1] = 255; // G
+        data[i + 2] = 0; // B
+        data[i + 3] = 255; // A
+        detectedCount++;
+      }
+    }
+    
+    ctx.putImageData(imageData, 0, 0);
+    localStorage.setItem('colorTest', canvas.toDataURL());
+    
+    // Show the color test canvas
+    setShowColorTestCanvas(true);
+    console.log(`Detected ${detectedCount} pink pixels`);
+    setMessage(`Green pixels show detected gap pad material. Found ${detectedCount} pixels (sensitivity: ${colorSensitivity}).`);
+  };
+
+  // Toggle manual detection mode
+  const toggleManualMode = () => {
+    setManualDetection(!manualDetection);
+    if (!manualDetection) {
+      setManualPositions([]); // Reset positions when enabling
+      setMessage("Manual detection mode enabled. Click on the image to add gap pad markers.");
+    } else {
+      setMessage("Manual detection mode disabled.");
+    }
+  };
+
+  // Reset manual markers
+  const resetManualMarkers = () => {
+    setManualPositions([]);
+    
+    if (canvasRef.current) {
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d');
+      const video = videoRef.current;
+      
+      if (video) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
+    }
+    
+    setMessage("Manual markers cleared");
+  };
+
+  // Change color detection sensitivity
+  const changeSensitivity = (newValue) => {
+    setColorSensitivity(newValue);
+    localStorage.setItem('colorSensitivity', newValue);
+    setMessage(`Color detection sensitivity set to ${newValue}`);
+  };
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#0a0a0a", color:"#e5e5e5", display:"flex", flexDirection:"column" }}>
+      <header style={{ padding:"1rem", borderBottom:"1px solid #27272a" }}>
+        <div>Gap Pad Web Validator</div>
+      </header>
+
+      <main style={{ flex:1, display:"grid", gridTemplateColumns:"2fr 1fr" }}>
+        <section style={{ padding:"1rem" }}>
+          <div style={{ position:"relative", background:"black", borderRadius:"12px", overflow:"hidden" }}>
+            <video 
+              ref={videoRef} 
+              style={{ 
+                width:"100%", 
+                aspectRatio:"16/9", 
+                objectFit:"contain", 
+                display: (showOverlay || showColorTestCanvas) ? "none" : "block" 
+              }} 
+              playsInline 
+              autoPlay 
+              muted 
+            />
+            
+            {showColorTestCanvas && canvasRef.current && (
+              <div style={{ position: "relative", width: "100%", aspectRatio: "16/9" }}>
+                <canvas
+                  ref={canvasRef}
+                  onClick={manualDetection ? addManualPadMarker : undefined}
+                  style={{ 
+                    width: "100%", 
+                    height: "100%", 
+                    objectFit: "contain",
+                    cursor: manualDetection ? 'crosshair' : 'default'
+                  }}
+                />
+                <button 
+                  style={{ position:"absolute", top:"10px", right:"10px", background:"#e11d48", padding:"8px", borderRadius:"4px", border:"none", color:"white" }}
+                  onClick={() => setShowColorTestCanvas(false)}
+                >
+                  Exit Color Test
+                </button>
+                
+                {manualDetection && (
+                  <div style={{ 
+                    position:"absolute", 
+                    top:"10px", 
+                    left:"10px", 
+                    background:"rgba(0,0,0,0.7)", 
+                    padding:"8px", 
+                    borderRadius:"4px", 
+                    color: "#f87171" 
+                  }}>
+                    Manual Mode: Click to add markers ({manualPositions.length})
+                    <button
+                      onClick={resetManualMarkers}
+                      style={{ marginLeft: "10px", background:"#ef4444", color:"white", border:"none", padding:"4px 8px", borderRadius:"4px", fontSize:"0.8rem" }}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+            
+            {showOverlay && validationResult && !showColorTestCanvas && (
+              <div style={{ width:"100%", aspectRatio:"16/9", position:"relative" }}>
+                <img 
+                  src={validationResult.referenceImage} 
+                  alt="Reference" 
+                  style={{ width:"100%", height:"100%", objectFit:"contain", opacity:0.6 }} 
+                />
+                <video 
+                  ref={videoRef} 
+                  style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%", objectFit:"contain", opacity:0.7, mixBlendMode:"difference" }} 
+                  playsInline 
+                  autoPlay 
+                  muted 
+                />
+                
+                {/* Draw pad position markers */}
+                {validationResult.padPositions && validationResult.padPositions.length > 0 && 
+                  validationResult.padPositions.map((pad, index) => (
+                    <div
+                      key={index}
+                      style={{
+                        position: "absolute",
+                        left: `${pad.x * 100}%`,
+                        top: `${pad.y * 100}%`,
+                        width: "30px",
+                        height: "30px",
+                        borderRadius: "50%",
+                        border: "4px solid lime",
+                        transform: "translate(-50%, -50%)",
+                        boxShadow: "0 0 0 2px rgba(0,0,0,0.7)",
+                        pointerEvents: "none"
+                      }}
+                    />
+                  ))
+                }
+                
+                <div style={{ position:"absolute", bottom:"10px", left:"10px", background:"rgba(0,0,0,0.7)", padding:"8px", borderRadius:"4px", fontSize:"12px" }}>
+                  Reference captured: {new Date(validationResult.timestamp).toLocaleString()}
+                </div>
+                
+                {/* Validation status indicator */}
+                {validationStatus && (
+                  <div 
+                    style={{ 
+                      position:"absolute", 
+                      top:"10px", 
+                      left:"10px", 
+                      background: validationStatus.status === "success" ? "rgba(22, 163, 74, 0.8)" : 
+                                 validationStatus.status === "warning" ? "rgba(245, 158, 11, 0.8)" : 
+                                 "rgba(225, 29, 72, 0.8)",
+                      padding:"12px 16px", 
+                      borderRadius:"4px",
+                      fontSize: "16px",
+                      fontWeight: "bold",
+                      boxShadow: "0 2px 5px rgba(0,0,0,0.3)",
+                      zIndex: 10
+                    }}
+                  >
+                    {validationStatus.status === "success" ? "✓ PASS" : 
+                     validationStatus.status === "warning" ? "⚠ CHECK" : "✗ FAIL"}
+                     <div style={{ fontSize: "14px", fontWeight: "normal", marginTop: "4px" }}>
+                       Match: {Math.round(validationStatus.matchPercentage)}%
+                     </div>
+                  </div>
+                )}
+                
+                <button 
+                  style={{ position:"absolute", top:"10px", right:"10px", background:"#e11d48", padding:"8px", borderRadius:"4px", border:"none", color:"white" }}
+                  onClick={stopValidation}
+                >
+                  Exit Overlay
+                </button>
+              </div>
+            )}
+            
+            <canvas ref={canvasRef} style={{ display: "none" }} />
+            <canvas ref={detectionCanvasRef} style={{ display: "none" }} />
+            
+            {!showOverlay && !showColorTestCanvas && (
+              <div style={{ position:"absolute", top:"10px", left:"10px", background:"rgba(0,0,0,0.6)", padding:"4px 8px", borderRadius:"8px", color: captureMode ? "#f87171" : "#e5e5e5" }}>
+                {captureMode ? "Capture Mode Active" : validationMode ? "Validation Mode Active" : ""}
+              </div>
+            )}
+          </div>
+          
+          <div style={{ marginTop:"1rem", display:"flex", gap:"0.5rem", flexWrap:"wrap" }}>
+            {validationMode ? (
+              <>
+                <button onClick={() => setValidationMode(false)}>
+                  Exit Validation Mode
+                </button>
+                <button 
+                  onClick={validateCurrentView} 
+                  style={{ background: "#2563eb", color: "white", border: "none", padding: "8px 16px", borderRadius: "4px" }}
+                  disabled={!hasReferenceImage()}
+                >
+                  Compare with Reference
+                </button>
+                <button
+                  onClick={testColorDetection}
+                  style={{ background: "#6366f1", color: "white", border: "none", padding: "8px 16px", borderRadius: "4px" }}
+                >
+                  Test Color Detection
+                </button>
+              </>
+            ) : captureMode ? (
+              <>
+                <button onClick={() => setCaptureMode(false)}>
+                  Cancel Capture
+                </button>
+                <button 
+                  onClick={captureReferenceImage}
+                  style={{ background: "#16a34a", color: "white", border: "none", padding: "8px 16px", borderRadius: "4px" }}
+                >
+                  Capture Reference Image
+                </button>
+                <button 
+                  onClick={testColorDetection}
+                  style={{ background: "#6366f1", color: "white", border: "none", padding: "8px 16px", borderRadius: "4px" }}
+                >
+                  Test Color Detection
+                </button>
+                <button 
+                  onClick={toggleManualMode}
+                  style={{ 
+                    background: manualDetection ? "#f97316" : "#6366f1", 
+                    color: "white", 
+                    border: "none", 
+                    padding: "8px 16px", 
+                    borderRadius: "4px" 
+                  }}
+                >
+                  {manualDetection ? "Disable Manual Mode" : "Enable Manual Mode"}
+                </button>
+              </>
+            ) : (
+              <>
+                <button onClick={() => setValidationMode(true)}>
+                  Enter Validation Mode
+                </button>
+                <button onClick={() => setCaptureMode(true)}>
+                  Set Reference Image
+                </button>
+                <button 
+                  onClick={testColorDetection}
+                  style={{ background: "#6366f1", color: "white", border: "none", padding: "8px 16px", borderRadius: "4px" }}
+                >
+                  Test Color Detection
+                </button>
+              </>
+            )}
+          </div>
+          
+          {message && (
+            <div style={{ 
+              marginTop:"0.75rem", 
+              padding:"0.75rem", 
+              background: message.includes("success") ? "rgba(22, 163, 74, 0.2)" : 
+                        message.includes("incorrect") ? "rgba(225, 29, 72, 0.2)" : 
+                        "rgba(0,0,0,0.4)", 
+              borderRadius:"4px", 
+              fontSize:"1rem",
+              boxShadow: "0 1px 3px rgba(0,0,0,0.2)"
+            }}>
+              {message}
+            </div>
+          )}
+          
+          {/* Sensitivity slider */}
+          <div style={{ 
+            marginTop: "0.75rem", 
+            background: "rgba(0,0,0,0.4)", 
+            padding: "0.75rem",
+            borderRadius: "4px",
+            boxShadow: "0 1px 3px rgba(0,0,0,0.2)"
+          }}>
+            <div style={{ fontSize: "0.9rem", marginBottom: "0.5rem" }}>
+              Color Detection Sensitivity: {colorSensitivity}
+            </div>
+            <div style={{ display: "flex", gap: "0.5rem" }}>
+              {[1, 2, 3, 4, 5].map(level => (
+                <button
+                  key={level}
+                  onClick={() => changeSensitivity(level)}
+                  style={{
+                    padding: "4px 8px",
+                    background: colorSensitivity === level ? "#2563eb" : "#1f1f1f",
+                    color: "white",
+                    border: "none",
+                    borderRadius: "4px",
+                    flex: 1
+                  }}
+                >
+                  {level}
+                </button>
+              ))}
+            </div>
+            <div style={{ fontSize: "0.8rem", color: "#a1a1aa", marginTop: "0.5rem" }}>
+              Lower = Strict detection, Higher = More lenient
+            </div>
+          </div>
+        </section>
+
+        <aside style={{ padding:"1rem", borderLeft:"1px solid #27272a" }}>
+          <div>
+            <label>Serial Number</label><br/>
+            <input 
+              value={serial} 
+              onChange={e => setSerial(e.target.value)} 
+              placeholder="Enter serial" 
+              style={{ width:"100%", padding:"8px", marginTop:"4px", background:"#1f1f1f", border:"1px solid #3f3f3f", color:"#e5e5e5", borderRadius:"4px" }} 
+            />
+          </div>
+          
+          <div style={{ marginTop:"1rem" }}>
+            <label>Gap Pad Side</label><br/>
+            <div style={{ display:"flex", gap:"0.5rem", marginTop:"4px" }}>
+              <button 
+                onClick={() => setSide("back")} 
+                style={{ 
+                  padding:"8px 16px", 
+                  background: side === "back" ? "#2563eb" : "#1f1f1f",
+                  color: side === "back" ? "white" : "#e5e5e5",
+                  border: "none",
+                  borderRadius: "4px"
+                }}
+              >
+                Back
+              </button>
+              <button 
+                onClick={() => setSide("front")} 
+                style={{ 
+                  padding:"8px 16px", 
+                  background: side === "front" ? "#2563eb" : "#1f1f1f",
+                  color: side === "front" ? "white" : "#e5e5e5",
+                  border: "none",
+                  borderRadius: "4px"
+                }}
+              >
+                Front
+              </button>
+            </div>
+          </div>
+          
+          <div style={{ marginTop:"1rem", fontSize:"0.8rem", color:"#a1a1aa" }}>
+            Product code: {(serial||"").slice(0,6).toUpperCase()} ({side})
+          </div>
+          
+          {hasReferenceImage() && (
+            <div style={{ marginTop:"1rem" }}>
+              <div style={{ fontSize:"0.8rem", marginBottom:"0.5rem", color:"#34d399" }}>
+                ✓ Reference image available
+              </div>
+              
+              {/* Show detected pad count if available */}
+              {referenceImages[`${serial.trim().toUpperCase()}_${side}`]?.padPositions && (
+                <div style={{ fontSize:"0.8rem", marginBottom:"0.5rem", color:"#94a3b8" }}>
+                  {referenceImages[`${serial.trim().toUpperCase()}_${side}`].padPositions.length || 0} gap pads detected
+                </div>
+              )}
+              
+              <button 
+                onClick={deleteReferenceImage}
+                style={{ background:"#ef4444", color:"white", border:"none", padding:"4px 8px", borderRadius:"4px", fontSize:"0.8rem" }}
+              >
+                Delete Reference
+              </button>
+              <div style={{ marginTop:"0.5rem" }}>
+                <button 
+                  onClick={() => {
+                    const key = `${serial.trim().toUpperCase()}_${side}`;
+                    if (referenceImages[key]) {
+                      setValidationResult({
+                        referenceImage: referenceImages[key].imageData,
+                        timestamp: referenceImages[key].timestamp,
+                        padPositions: referenceImages[key].padPositions || []
+                      });
+                      setShowOverlay(true);
+                      setValidationStatus(null); // No validation status when just viewing
+                    }
+                  }}
+                  style={{ background:"#1f1f1f", border:"none", padding:"4px 8px", borderRadius:"4px", fontSize:"0.8rem" }}
+                >
+                  View Reference
+                </button>
+              </div>
+            </div>
+          )}
+          
+          <div style={{ marginTop:"1.5rem", fontSize:"0.8rem", color:"#a1a1aa", borderTop:"1px solid #27272a", paddingTop:"1rem" }}>
+            <div>Reference Library:</div>
+            <div style={{ fontSize:"0.7rem", marginTop:"0.5rem" }}>
+              {Object.keys(referenceImages).length} images stored
+            </div>
+          </div>
+
+          <div style={{ marginTop:"1.5rem", fontSize:"0.8rem", color:"#a1a1aa", borderTop:"1px solid #27272a", paddingTop:"1rem" }}>
+            <div>Detection Settings:</div>
+            <div style={{ fontSize:"0.7rem", marginTop:"0.5rem", lineHeight: "1.4" }}>
+              Looking for magenta/pink colored gap pads<br/>
+              Tolerance: {10 + (colorSensitivity * 2)}%<br/>
+              Minimum size: {30 - (colorSensitivity * 3)}px<br/>
+              Sensitivity level: {colorSensitivity}/5
+            </div>
+            <div style={{ fontSize:"0.7rem", marginTop:"0.5rem" }}>
+              <button
+                onClick={() => {
+                  // Delete all reference images
+                  localStorage.removeItem('gapPadReferenceImages');
+                  setReferenceImages({});
+                  setMessage("All reference images cleared");
+                }}
+                style={{ background:"#ef4444", color:"white", border:"none", padding:"4px 8px", borderRadius:"4px", fontSize:"0.7rem" }}
+              >
+                Clear All References
+              </button>
+            </div>
+          </div>
+          
+          {/* Instructions */}
+          <div style={{ marginTop:"1.5rem", fontSize:"0.8rem", color:"#a1a1aa", borderTop:"1px solid #27272a", paddingTop:"1rem" }}>
+            <div>Tips:</div>
+            <ul style={{ fontSize:"0.7rem", marginTop:"0.5rem", lineHeight: "1.4", paddingLeft: "1rem" }}>
+              <li>Use Test Color Detection first</li>
+              <li>Increase sensitivity if pink areas aren't detected</li>
+              <li>Use Manual Mode if automatic detection fails</li>
+              <li>Ensure good lighting for best results</li>
+            </ul>
+          </div>
+        </aside>
+      </main>
+    </div>
+  );
+}
