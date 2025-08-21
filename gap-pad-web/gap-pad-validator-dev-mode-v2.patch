@@ -1,0 +1,101 @@
+*** Begin Patch
+*** Update File: gap-pad-web/src/App.jsx
+@@
+-import React, { useRef, useState, useEffect } from "react";
+-import PRODUCT_LIBRARY from "./productLibrary.js";
+-
+-// Use the external product library
+-const PRODUCT_TEMPLATES = PRODUCT_LIBRARY;
++import React, { useRef, useState, useEffect } from "react";
++import PRODUCT_LIBRARY from "./productLibrary.js";
++
++// Use the external product library
++const PRODUCT_TEMPLATES = PRODUCT_LIBRARY;
++// Dev mode flag: controls training features; set VITE_DEV_MODE=true in .env for dev builds
++const DEV_MODE = import.meta.env?.VITE_DEV_MODE === 'true';
+@@ function App() {
+       const [manualPadPositions, setManualPadPositions] = useState([]);
+       const [cameraCalibration, setCameraCalibration] = useState({
+         pixelsPerMm: 10, // Default calibration
+         offsetX: 0,
+         offsetY: 0
+       });
+       const [showCalibration, setShowCalibration] = useState(false);
++      // State for training mode (dev builds only)
++      const [trainingMode, setTrainingMode] = useState(false);
++      const [trainingData, setTrainingData] = useState([]);
+@@
+       const performCalibration = () => {
+         // This would typically use a known reference object
+         // For now, we'll use a simple approach
+@@
+         setCameraCalibration(newCalibration);
+         setShowCalibration(false);
+         setMessage("Camera calibration updated");
+       };
++
++      // Dev-only: capture current frame and manual pad positions as training data
++      const captureTrainingData = () => {
++        if (!canvasRef.current) return;
++        const imageDataUrl = canvasRef.current.toDataURL('image/png');
++        const entry = {
++          product: selectedProduct,
++          variant: selectedVariant,
++          image: imageDataUrl,
++          pads: manualPadPositions,
++          timestamp: Date.now(),
++        };
++        setTrainingData(prev => [...prev, entry]);
++        setMessage("Training data captured");
++      };
++
++      // Dev-only: export collected training data as a JSON file
++      const exportTrainingData = () => {
++        const json = JSON.stringify(trainingData, null, 2);
++        const blob = new Blob([json], { type: 'application/json' });
++        const url = URL.createObjectURL(blob);
++        const a = document.createElement('a');
++        a.href = url;
++        a.download = 'gap_pad_training_data.json';
++        document.body.appendChild(a);
++        a.click();
++        document.body.removeChild(a);
++        URL.revokeObjectURL(url);
++        setMessage("Training data exported");
++      };
+@@
+       return (
+         <div style={{ padding: "20px", backgroundColor: "#0a0a0a", minHeight: "100vh", color: "#e5e5e5" }}>
+           <h1 style={{ textAlign: "center", marginBottom: "30px", color: "#00ff00" }}>
+             Gap Pad Validator - Enhanced
+           </h1>
++          {/* Dev controls: only visible when DEV_MODE is true */}
++          {DEV_MODE && (
++            <div style={{ marginBottom: '20px', padding: '10px', border: '1px solid #444', borderRadius: '4px', backgroundColor: '#1a1a1a' }}>
++              <label style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
++                <input
++                  type="checkbox"
++                  checked={trainingMode}
++                  onChange={() => setTrainingMode(!trainingMode)}
++                />
++                Enable Training Mode
++              </label>
++              {trainingMode && (
++                <div style={{ marginTop: '10px', display: 'flex', gap: '10px' }}>
++                  <button
++                    onClick={captureTrainingData}
++                    style={{ padding: '8px 16px', borderRadius: '4px', backgroundColor: '#0077cc', color: '#fff', border: 'none' }}
++                  >
++                    Capture Training Data
++                  </button>
++                  <button
++                    onClick={exportTrainingData}
++                    style={{ padding: '8px 16px', borderRadius: '4px', backgroundColor: '#555', color: '#fff', border: 'none' }}
++                  >
++                    Export Dataset
++                  </button>
++                </div>
++              )}
++            </div>
++          )}
+*** End Patch
