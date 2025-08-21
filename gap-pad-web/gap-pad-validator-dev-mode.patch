@@ -1,0 +1,79 @@
+--- a/gap-pad-web/src/App.jsx
+++ b/gap-pad-web/src/App.jsx
+@@
+-import React, { useRef, useState, useEffect } from "react";
++import React, { useRef, useState, useEffect } from "react";
++// Enable developer-only training features when VITE_DEV_MODE=true
++const DEV_MODE = import.meta.env.VITE_DEV_MODE === 'true';
+
+@@
+ const [manualPadPositions, setManualPadPositions] = useState([]);
+ const [cameraCalibration, setCameraCalibration] = useState({
+   pixelsPerMm: 10, // Default calibration
+   offsetX: 0,
+   offsetY: 0
+ });
+ const [showCalibration, setShowCalibration] = useState(false);
++  // Training mode state for Dev Mode
++  const [trainingMode, setTrainingMode] = useState(false);
++  const [trainingData, setTrainingData] = useState([]);
++  // Capture a training sample: current frame + manual pad positions
++  const captureTrainingData = () => {
++    if (!canvasRef.current) return;
++    const imageDataUrl = canvasRef.current.toDataURL('image/png');
++    const entry = {
++      product: selectedProduct,
++      variant: selectedVariant,
++      image: imageDataUrl,
++      pads: manualPadPositions,
++      timestamp: Date.now(),
++    };
++    setTrainingData(prev => [...prev, entry]);
++  };
++  // Export collected training data as JSON
++  const exportTrainingData = () => {
++    const json = JSON.stringify(trainingData, null, 2);
++    const blob = new Blob([json], { type: 'application/json' });
++    const url = URL.createObjectURL(blob);
++    const a = document.createElement('a');
++    a.href = url;
++    a.download = 'gap_pad_training_data.json';
++    document.body.appendChild(a);
++    a.click();
++    document.body.removeChild(a);
++    URL.revokeObjectURL(url);
++  };
+
+@@
+ {/* Message Display */}
+ {message && ( ... )}
+
++      {/* Developer Training Controls (visible only when DEV_MODE is true) */}
++      {DEV_MODE && (
++        <div className="dev-controls" style={{ marginTop: '20px', padding: '10px', border: '1px solid #444', borderRadius: '4px', backgroundColor: '#222' }}>
++          <label style={{ marginRight: '10px' }}>
++            <input
++              type="checkbox"
++              checked={trainingMode}
++              onChange={() => setTrainingMode(!trainingMode)}
++            />
++            Enable Training Mode
++          </label>
++          {trainingMode && (
++            <div style={{ marginTop: '10px' }}>
++              <button
++                onClick={captureTrainingData}
++                style={{ marginRight:'10px', padding: '8px 16px', borderRadius:'4px', backgroundColor:'#0077cc', color:'#fff', border:'none' }}
++              >
++                Capture Training Data
++              </button>
++              <button
++                onClick={exportTrainingData}
++                style={{ padding: '8px 16px', borderRadius:'4px', backgroundColor:'#555', color:'#fff', border:'none' }}
++              >
++                Export Dataset
++              </button>
++            </div>
++          )}
++        </div>
++      )}
